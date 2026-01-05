@@ -36,13 +36,13 @@ class IpStats:
 class NetworkMonitor:
     """Monitors network traffic and detects suspicious IPs and subnets"""
     
-    def __init__(self, window_seconds=10, max_packets=500, max_ports=50, alert_cooldown=30, auto_block=False, exclude_ip=None):
+    def __init__(self, window_seconds=10, max_packets=500, max_ports=50, alert_cooldown=30, auto_block=False, exclude_ips=None):
         self.window = timedelta(seconds=window_seconds)
         self.max_packets = max_packets
         self.max_ports = max_ports
         self.alert_cooldown = timedelta(seconds=alert_cooldown)
         self.auto_block = auto_block  # Automatically add firewall rules for L4
-        self.exclude_ip = exclude_ip  # IP address to exclude from monitoring (e.g., host's public IP)
+        self.exclude_ips = set()  # Will be loaded from file or set from parameter
         # How long an IP/subnet should stay visible once it has reached a level > 0
         self.persistence_window = timedelta(hours=24)
         self.stats = defaultdict(IpStats)
@@ -59,6 +59,16 @@ class NetworkMonitor:
         self.log_path = os.path.join(base_dir, "net_monitor.log")
         self.blocked_file = os.path.join(base_dir, "blocked_entities.json")
         self.status_file = os.path.join(base_dir, "net_monitor_status.json")
+        self.excluded_ips_file = os.path.join(base_dir, "excluded_ips.json")
+        
+        # Load excluded IPs from JSON file (if not provided via command line)
+        if exclude_ips is None:
+            self._load_excluded_ips()
+        else:
+            if isinstance(exclude_ips, str):
+                self.exclude_ips = {exclude_ips}
+            else:
+                self.exclude_ips = set(exclude_ips) if exclude_ips else set()
         
         # Load previously blocked entities from file
         self._load_blocked_entities()
@@ -75,6 +85,21 @@ class NetworkMonitor:
         except Exception:
             # Logging failures should not break monitoring
             pass
+    
+    def _load_excluded_ips(self) -> None:
+        """Load excluded IPs from JSON file."""
+        try:
+            if os.path.exists(self.excluded_ips_file):
+                with open(self.excluded_ips_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.exclude_ips = set(data.get("excluded_ips", []))
+                    if self.exclude_ips:
+                        self._log(f"Loaded {len(self.exclude_ips)} excluded IPs from {self.excluded_ips_file}: {', '.join(sorted(self.exclude_ips))}")
+            else:
+                self.exclude_ips = set()
+        except Exception as e:
+            self._log(f"Error loading excluded IPs: {e}")
+            self.exclude_ips = set()
     
     def _load_blocked_entities(self) -> None:
         """Load previously blocked entities from JSON file."""
@@ -373,8 +398,8 @@ class NetworkMonitor:
         src_ip = ip_layer.src
         dst_ip = ip_layer.dst
 
-        # Skip traffic sourced from excluded IP (e.g., host's public IP)
-        if self.exclude_ip and src_ip == self.exclude_ip:
+        # Skip traffic sourced from excluded IPs (e.g., host's public IP or self IPs)
+        if src_ip in self.exclude_ips:
             return
 
         dst_port = None
@@ -843,13 +868,25 @@ def main():
     parser.add_argument(
         "--exclude-ip",
         type=str,
+        action="append",
         default=None,
-        help="IP address to exclude from monitoring (e.g., host's public IP). Can also be set via EXCLUDE_IP environment variable."
+        help="IP address(es) to exclude from monitoring (optional, overrides excluded_ips.json). Can be specified multiple times or comma-separated. By default, excluded IPs are loaded from excluded_ips.json file."
     )
     args = parser.parse_args()
 
-    # Check for exclude IP in environment variable if not provided via command line
-    exclude_ip = args.exclude_ip or os.getenv("EXCLUDE_IP")
+    # Collect exclude IPs from command line arguments (if provided, overrides JSON file)
+    exclude_ips = None
+    if args.exclude_ip:
+        exclude_ips = []
+        for ip_arg in args.exclude_ip:
+            # Support comma-separated IPs
+            exclude_ips.extend([ip.strip() for ip in ip_arg.split(",") if ip.strip()])
+    
+    # Check for exclude IPs in environment variable if not provided via command line
+    if exclude_ips is None:
+        env_exclude = os.getenv("EXCLUDE_IP")
+        if env_exclude:
+            exclude_ips = [ip.strip() for ip in env_exclude.split(",") if ip.strip()]
 
     monitor = NetworkMonitor(
         window_seconds=args.window_seconds,
@@ -857,7 +894,7 @@ def main():
         max_ports=args.max_ports,
         alert_cooldown=args.alert_cooldown,
         auto_block=args.auto_block,
-        exclude_ip=exclude_ip
+        exclude_ips=exclude_ips
     )
     monitor.start(interface_id=args.interface)
 

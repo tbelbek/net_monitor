@@ -43,6 +43,9 @@ blocked_entities.json
 # Status tracking
 net_monitor_status.json
 
+# Excluded IPs
+excluded_ips.json
+
 # OS
 .DS_Store
 Thumbs.db
