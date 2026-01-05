@@ -53,6 +53,7 @@ class NetworkMonitor:
         self.display_lock = Lock()
         self.firewall_suggestions = {}  # entity -> {"added": datetime, "is_subnet": bool}
         self.blocked_entities = set()  # Track already blocked entities
+        self.logged_skip_entities = set()  # Track entities that have been logged as skipped
 
         # Log file (in the same directory as this script)
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -292,12 +293,16 @@ class NetworkMonitor:
         Returns True if successful, False otherwise.
         """
         if entity in self.blocked_entities:
-            self._log(f"FIREWALL_SKIP {entity} (already in blocked list)")
+            if entity not in self.logged_skip_entities:
+                self._log(f"FIREWALL_SKIP {entity} (already in blocked list)")
+                self.logged_skip_entities.add(entity)
             return True  # Already blocked
         
         if not is_subnet:
             if entity in self.exclude_ips:
-                self._log(f"FIREWALL_SKIP {entity} (in excluded IPs list)")
+                if entity not in self.logged_skip_entities:
+                    self._log(f"FIREWALL_SKIP {entity} (in excluded IPs list)")
+                    self.logged_skip_entities.add(entity)
                 return True
         else:
             subnet_base = entity.split("/")[0]
@@ -309,11 +314,15 @@ class NetworkMonitor:
                     if len(excluded_octets) >= 2:
                         excluded_prefix = f"{excluded_octets[0]}.{excluded_octets[1]}"
                         if excluded_prefix == subnet_prefix:
-                            self._log(f"FIREWALL_SKIP {entity} (subnet contains excluded IP {excluded_ip})")
+                            if entity not in self.logged_skip_entities:
+                                self._log(f"FIREWALL_SKIP {entity} (subnet contains excluded IP {excluded_ip})")
+                                self.logged_skip_entities.add(entity)
                             return True
         
         if not platform.system().lower().startswith("win"):
-            self._log(f"FIREWALL_SKIP {entity} (not Windows)")
+            if entity not in self.logged_skip_entities:
+                self._log(f"FIREWALL_SKIP {entity} (not Windows)")
+                self.logged_skip_entities.add(entity)
             return False
         
         try:
@@ -370,6 +379,70 @@ class NetworkMonitor:
             return False
         except Exception as e:
             self._log(f"FIREWALL_EXCEPTION {entity} error={str(e)}")
+            return False
+    
+    def _test_firewall_privileges(self) -> bool:
+        """
+        Test firewall rule creation/removal to verify Administrator privileges.
+        Creates a test rule, verifies it exists, then removes it.
+        Returns True if privileges are sufficient, False otherwise.
+        """
+        if not platform.system().lower().startswith("win"):
+            return False
+        
+        test_ip = "192.0.2.1"  # Test-Net IP (RFC 5737) - safe to use for testing
+        display_name = f"Block_Attacker_TEST_PRIV_CHECK"
+        
+        try:
+            # Try to create a test firewall rule
+            create_cmd = [
+                "powershell", "-Command",
+                f"New-NetFirewallRule -DisplayName '{display_name}' "
+                f"-Direction Inbound -Action Block -RemoteAddress '{test_ip}' "
+                f"-Protocol Any -ErrorAction Stop"
+            ]
+            
+            result = subprocess.run(create_cmd, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0:
+                # Rule created successfully, now verify it exists
+                check_cmd = [
+                    "powershell", "-Command",
+                    f"Get-NetFirewallRule -DisplayName '{display_name}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DisplayName"
+                ]
+                check_result = subprocess.run(check_cmd, capture_output=True, text=True, timeout=5)
+                
+                if check_result.returncode == 0 and check_result.stdout.strip():
+                    # Rule exists, now remove it
+                    remove_cmd = [
+                        "powershell", "-Command",
+                        f"Remove-NetFirewallRule -DisplayName '{display_name}' -ErrorAction Stop"
+                    ]
+                    remove_result = subprocess.run(remove_cmd, capture_output=True, text=True, timeout=10)
+                    
+                    if remove_result.returncode == 0:
+                        self._log(f"FIREWALL_PRIV_CHECK SUCCESS (test rule created and removed)")
+                        return True
+                    else:
+                        self._log(f"FIREWALL_PRIV_CHECK WARNING (rule created but removal failed: {remove_result.stderr})")
+                        # Try to remove it anyway, but don't fail the check
+                        return True
+                else:
+                    self._log(f"FIREWALL_PRIV_CHECK WARNING (rule created but verification failed)")
+                    return True
+            else:
+                error_msg = result.stderr.strip() if result.stderr else result.stdout.strip()
+                if "Access is denied" in error_msg or "PermissionDenied" in error_msg:
+                    self._log(f"FIREWALL_PRIV_CHECK FAILED (Access denied - insufficient privileges)")
+                else:
+                    self._log(f"FIREWALL_PRIV_CHECK FAILED (error: {error_msg})")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            self._log(f"FIREWALL_PRIV_CHECK FAILED (timeout)")
+            return False
+        except Exception as e:
+            self._log(f"FIREWALL_PRIV_CHECK FAILED (exception: {str(e)})")
             return False
     
     def _classify_severity(self, packet_count: int, unique_ports: int, suspicion_count: int) -> int:
@@ -821,6 +894,11 @@ class NetworkMonitor:
                     sys.exit(1)
         
         print(f"\nMonitoring traffic on: {interface if interface else 'all interfaces'}")
+        
+        # Test firewall privileges if auto-block is enabled
+        if self.auto_block:
+            self._test_firewall_privileges()
+        
         print("Starting dynamic display...\n")
         
         self.running = True
