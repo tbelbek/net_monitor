@@ -295,6 +295,23 @@ class NetworkMonitor:
             self._log(f"FIREWALL_SKIP {entity} (already in blocked list)")
             return True  # Already blocked
         
+        if not is_subnet:
+            if entity in self.exclude_ips:
+                self._log(f"FIREWALL_SKIP {entity} (in excluded IPs list)")
+                return True
+        else:
+            subnet_base = entity.split("/")[0]
+            octets = subnet_base.split(".")
+            if len(octets) >= 2:
+                subnet_prefix = f"{octets[0]}.{octets[1]}"
+                for excluded_ip in self.exclude_ips:
+                    excluded_octets = excluded_ip.split(".")
+                    if len(excluded_octets) >= 2:
+                        excluded_prefix = f"{excluded_octets[0]}.{excluded_octets[1]}"
+                        if excluded_prefix == subnet_prefix:
+                            self._log(f"FIREWALL_SKIP {entity} (subnet contains excluded IP {excluded_ip})")
+                            return True
+        
         if not platform.system().lower().startswith("win"):
             self._log(f"FIREWALL_SKIP {entity} (not Windows)")
             return False

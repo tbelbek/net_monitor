@@ -8,6 +8,7 @@ A Python-based network monitoring tool that uses Npcap to monitor all network tr
 - Detection of suspicious IPs and /16 subnets based on packet counts and port scanning patterns
 - Four-level severity classification system (L1-L4) with cubic escalation thresholds
 - Automatic Windows Firewall rule creation for L4 threats (optional)
+- Protection against blocking excluded IPs (excluded IPs are never blocked even if they reach L4)
 - Windows toast notifications for critical subnet attacks
 - Persistent status tracking across restarts
 - Real-time console display with organized severity columns
@@ -67,7 +68,7 @@ python net_monitor.py [OPTIONS]
 - `--max-packets COUNT` - Maximum packets per window to trigger suspicion (default: 20)
 - `--max-ports COUNT` - Maximum unique destination ports per window to trigger suspicion (default: 50)
 - `--alert-cooldown SECONDS` - Seconds between alerts for the same IP (default: 30)
-- `--exclude-ip IP_ADDRESS` - IP address to exclude from monitoring (e.g., host's public IP). Can also be set via `EXCLUDE_IP` environment variable.
+- `--exclude-ip IP_ADDRESS` - IP address to exclude from monitoring and blocking (e.g., host's public IP). Can be specified multiple times or comma-separated. Can also be set via `EXCLUDE_IP` environment variable. Excluded IPs are loaded from `excluded_ips.json` by default.
 
 ### Examples
 
@@ -86,16 +87,23 @@ Monitor with custom thresholds and auto-blocking:
 python net_monitor.py --window-seconds 10 --max-packets 500 --max-ports 50 --auto-block
 ```
 
-Exclude host's public IP from monitoring:
+Exclude host's public IP from monitoring and blocking:
 ```bash
 python net_monitor.py --exclude-ip 203.0.113.1
 ```
 
+Exclude multiple IPs:
+```bash
+python net_monitor.py --exclude-ip 203.0.113.1 --exclude-ip 192.168.1.1
+```
+
 Or set via environment variable:
 ```bash
-set EXCLUDE_IP=203.0.113.1
+set EXCLUDE_IP=203.0.113.1,192.168.1.1
 python net_monitor.py
 ```
+
+**Note**: Excluded IPs are also loaded from `excluded_ips.json` file. If you specify `--exclude-ip`, it overrides the JSON file. Excluded IPs will never be blocked, even if they reach L4 severity.
 
 ## Detection Criteria
 
@@ -159,6 +167,14 @@ JSON file containing entities that have been blocked via Windows Firewall:
 - List of blocked IPs and subnets
 - Last update timestamp
 
+### `excluded_ips.json`
+
+JSON file containing IP addresses to exclude from monitoring and blocking:
+- List of excluded IP addresses
+- Excluded IPs are not monitored for suspicious activity
+- Excluded IPs are never blocked, even if they reach L4 severity
+- Subnets containing excluded IPs are also prevented from being blocked
+
 ## Windows Firewall Integration
 
 When `--auto-block` is enabled, the tool automatically creates Windows Firewall rules for L4 entities:
@@ -168,7 +184,10 @@ When `--auto-block` is enabled, the tool automatically creates Windows Firewall 
 
 Firewall rules are named: `Block_Attacker_{entity}` (with dots and slashes replaced by underscores)
 
-The tool checks if a rule already exists before creating a new one to avoid duplicates.
+**Protection Mechanisms:**
+- The tool checks if a rule already exists before creating a new one to avoid duplicates
+- **Excluded IPs are never blocked**: IPs in `excluded_ips.json` or specified via `--exclude-ip` are skipped from firewall rule creation
+- **Subnet protection**: Subnets containing excluded IPs are also prevented from being blocked
 
 **Note**: Firewall rule creation requires Administrator privileges and may take a few seconds per rule.
 
