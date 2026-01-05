@@ -46,6 +46,9 @@ net_monitor_status.json
 # Excluded IPs
 excluded_ips.json
 
+# Environment variables
+.env
+
 # OS
 .DS_Store
 Thumbs.db

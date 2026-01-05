@@ -13,10 +13,19 @@ import subprocess
 import json
 import socket
 import ipaddress
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from collections import deque, defaultdict
 from datetime import datetime, timedelta
 from threading import Lock, Thread
 from scapy.all import get_if_list, sniff, IP, TCP, UDP
+
+try:
+    from dotenv import load_dotenv
+    DOTENV_AVAILABLE = True
+except ImportError:
+    DOTENV_AVAILABLE = False
 
 
 class IpStats:
@@ -38,13 +47,25 @@ class IpStats:
 class NetworkMonitor:
     """Monitors network traffic and detects suspicious IPs and subnets"""
     
-    def __init__(self, window_seconds=10, max_packets=500, max_ports=50, alert_cooldown=30, auto_block=False, exclude_ips=None):
+    def __init__(self, window_seconds=10, max_packets=500, max_ports=50, alert_cooldown=30, auto_block=False, exclude_ips=None, 
+                 email_smtp_server=None, email_smtp_port=587, email_username=None, email_password=None, 
+                 email_from=None, email_to=None, email_use_tls=True):
         self.window = timedelta(seconds=window_seconds)
         self.max_packets = max_packets
         self.max_ports = max_ports
         self.alert_cooldown = timedelta(seconds=alert_cooldown)
         self.auto_block = auto_block  # Automatically add firewall rules for L4
         self.exclude_ips = set()  # Will be loaded from file or set from parameter
+        
+        # Email alert configuration
+        self.email_smtp_server = email_smtp_server
+        self.email_smtp_port = email_smtp_port
+        self.email_username = email_username
+        self.email_password = email_password
+        self.email_from = email_from
+        self.email_to = email_to if email_to else []
+        self.email_use_tls = email_use_tls
+        self.email_enabled = bool(email_smtp_server and email_username and email_password and email_from and email_to)
         # How long an IP/subnet should stay visible once it has reached a level > 0
         self.persistence_window = timedelta(hours=24)
         self.stats = defaultdict(IpStats)
@@ -55,12 +76,17 @@ class NetworkMonitor:
         self.display_lock = Lock()
         self.firewall_suggestions = {}  # entity -> {"added": datetime, "is_subnet": bool}
         self.logged_skip_entities = set()  # Track entities that have been logged as skipped
+        self.firewall_block_emails_sent = set()  # Track entities that have had firewall block emails sent
+        self.attack_start_emails_sent = set()  # Track entities that have had attack start emails sent
+        self.attack_decay_emails_sent = set()  # Track entities that have had attack decay emails sent (to prevent duplicates)
 
         # Log file (in the same directory as this script)
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.log_path = os.path.join(base_dir, "net_monitor.log")
+        self.log_dir = base_dir
         self.status_file = os.path.join(base_dir, "net_monitor_status.json")
         self.excluded_ips_file = os.path.join(base_dir, "excluded_ips.json")
+        self.last_log_date = None  # Track the date of the current log file
         
         # Load excluded IPs from JSON file (if not provided via command line)
         if exclude_ips is None:
@@ -74,11 +100,78 @@ class NetworkMonitor:
         # Automatically detect and exclude local IPs and WAN IP
         self._auto_exclude_local_and_wan_ips()
         
+        # Log email configuration status
+        if self.email_enabled:
+            self._log(f"Email alerts enabled: SMTP={self.email_smtp_server}:{self.email_smtp_port}, From={self.email_from}, To={', '.join(self.email_to)}")
+        else:
+            self._log("Email alerts disabled (email configuration not provided)")
+        
+        # Initialize log rotation (check if log file exists and get its date)
+        self._initialize_log_rotation()
+        
         # Load previous status if available
         self._load_status()
 
+    def _initialize_log_rotation(self) -> None:
+        """Initialize log rotation by checking the current log file date."""
+        try:
+            if os.path.exists(self.log_path):
+                # Try to read the first line to get the actual log date
+                try:
+                    with open(self.log_path, "r", encoding="utf-8") as f:
+                        first_line = f.readline().strip()
+                        if first_line:
+                            # Extract date from timestamp (format: YYYY-MM-DDTHH:MM:SS...)
+                            date_str = first_line.split("T")[0]
+                            self.last_log_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                        else:
+                            # Empty file, use file modification time
+                            file_mtime = datetime.utcfromtimestamp(os.path.getmtime(self.log_path))
+                            self.last_log_date = file_mtime.date()
+                except (ValueError, IndexError, IOError):
+                    # Fallback to file modification time if parsing fails
+                    file_mtime = datetime.utcfromtimestamp(os.path.getmtime(self.log_path))
+                    self.last_log_date = file_mtime.date()
+            else:
+                self.last_log_date = datetime.utcnow().date()
+        except Exception:
+            self.last_log_date = datetime.utcnow().date()
+    
+    def _rotate_log_if_needed(self) -> None:
+        """Rotate log file if it's a new day."""
+        try:
+            now = datetime.utcnow()
+            current_date = now.date()
+            
+            # Check if we need to rotate (new day)
+            if self.last_log_date is not None and self.last_log_date != current_date:
+                if os.path.exists(self.log_path):
+                    # Create rotated log filename with date: net_monitor.log.YYYY-MM-DD
+                    rotated_name = f"net_monitor.log.{self.last_log_date.isoformat()}"
+                    rotated_path = os.path.join(self.log_dir, rotated_name)
+                    
+                    # Rename the old log file
+                    if not os.path.exists(rotated_path):
+                        os.rename(self.log_path, rotated_path)
+                    else:
+                        # If rotated file already exists, append to it
+                        with open(self.log_path, "r", encoding="utf-8") as old_log:
+                            with open(rotated_path, "a", encoding="utf-8") as rotated_log:
+                                rotated_log.write(f"\n--- Continued from {self.last_log_date.isoformat()} ---\n")
+                                rotated_log.write(old_log.read())
+                        os.remove(self.log_path)
+            
+            # Update the last log date
+            self.last_log_date = current_date
+        except Exception:
+            # Log rotation failures should not break monitoring
+            pass
+    
     def _log(self, message: str) -> None:
         """Append a log line with UTC timestamp to the log file."""
+        # Rotate log if needed (check daily)
+        self._rotate_log_if_needed()
+        
         timestamp = datetime.utcnow().isoformat()
         try:
             with open(self.log_path, "a", encoding="utf-8") as f:
@@ -241,7 +334,7 @@ class NetworkMonitor:
             self._log("No additional IPs auto-excluded (server IPs and WAN IP already in exclusion list or not detected)")
     
     def _save_status(self) -> None:
-        """Save current monitoring status to JSON file (only active IPs/subnets)."""
+        """Save current monitoring status to JSON file (only L4 entities persist between restarts)."""
         try:
             now = datetime.utcnow()
             status_data = {
@@ -250,7 +343,9 @@ class NetworkMonitor:
                 "subnet_stats": {},
                 "detected_ips": sorted(list(self.detected_ips)),
                 "detected_subnets": sorted(list(self.detected_subnets)),
-                "firewall_suggestions": {}
+                "firewall_suggestions": {},
+                "attack_start_emails_sent": sorted(list(self.attack_start_emails_sent)),
+                "attack_decay_emails_sent": sorted(list(self.attack_decay_emails_sent))
             }
             
             # Save firewall suggestions
@@ -260,23 +355,11 @@ class NetworkMonitor:
                     "is_subnet": info["is_subnet"]
                 }
             
-            # Save IP stats (only active ones)
+            # Save IP stats (only L4 entities - suspicion_count >= 1024)
             for ip, stats in self.stats.items():
                 with stats.lock:
-                    # Clean old packets
-                    while stats.packet_times and now - stats.packet_times[0] > self.window:
-                        stats.packet_times.popleft()
-                    
-                    packet_count = len(stats.packet_times)
-                    unique_ports = len(stats.dst_ports)
-                    
-                    base_suspicious = (
-                        packet_count >= self.max_packets
-                        or unique_ports >= self.max_ports
-                    )
-                    
-                    # Only save if currently active (suspicious in current window)
-                    if base_suspicious and (stats.suspicion_count > 0 or stats.last_level > 0):
+                    # Only save L4 entities (suspicion_count >= 1024, which is 16 * 4^3)
+                    if stats.suspicion_count >= 1024:
                         status_data["ip_stats"][ip] = {
                             "suspicion_count": stats.suspicion_count,
                             "last_level": stats.last_level,
@@ -285,23 +368,11 @@ class NetworkMonitor:
                             "in_attack": stats.in_attack
                         }
             
-            # Save subnet stats (only active ones)
+            # Save subnet stats (only L4 entities - suspicion_count >= 1024)
             for subnet, stats in self.subnet_stats.items():
                 with stats.lock:
-                    # Clean old packets
-                    while stats.packet_times and now - stats.packet_times[0] > self.window:
-                        stats.packet_times.popleft()
-                    
-                    packet_count = len(stats.packet_times)
-                    unique_ports = len(stats.dst_ports)
-                    
-                    base_suspicious = (
-                        packet_count >= self.max_packets
-                        or unique_ports >= self.max_ports
-                    )
-                    
-                    # Only save if currently active (suspicious in current window)
-                    if base_suspicious and (stats.suspicion_count > 0 or stats.last_level > 0):
+                    # Only save L4 entities (suspicion_count >= 1024, which is 16 * 4^3)
+                    if stats.suspicion_count >= 1024:
                         status_data["subnet_stats"][subnet] = {
                             "suspicion_count": stats.suspicion_count,
                             "last_level": stats.last_level,
@@ -359,6 +430,12 @@ class NetworkMonitor:
                     "is_subnet": info_data.get("is_subnet", False)
                 }
             
+            # Restore attack start emails sent (to prevent duplicate emails after restart)
+            self.attack_start_emails_sent = set(data.get("attack_start_emails_sent", []))
+            
+            # Restore attack decay emails sent (to prevent duplicate emails after restart)
+            self.attack_decay_emails_sent = set(data.get("attack_decay_emails_sent", []))
+            
             loaded_ips = len(data.get("ip_stats", {}))
             loaded_subnets = len(data.get("subnet_stats", {}))
             loaded_firewall = len(data.get("firewall_suggestions", {}))
@@ -366,40 +443,30 @@ class NetworkMonitor:
         except Exception as e:
             self._log(f"Error loading status: {e}")
     
-    def _show_notification(self, title: str, message: str) -> None:
-        """Show a Windows toast notification."""
-        if not platform.system().lower().startswith("win"):
+    def _send_email_alert(self, subject: str, body: str) -> None:
+        """Send an email alert."""
+        if not self.email_enabled:
+            self._log(f"Email alert skipped (email not enabled): {subject}")
             return
         
         try:
-            from win10toast import ToastNotifier
-            toaster = ToastNotifier()
-            toaster.show_toast(
-                title=title,
-                msg=message,
-                duration=10,
-                threaded=True
-            )
-        except ImportError:
-            # Fallback to PowerShell toast notification
-            try:
-                ps_cmd = [
-                    "powershell", "-Command",
-                    f"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; "
-                    f"$template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); "
-                    f"$textNodes = $template.GetElementsByTagName('text'); "
-                    f"$textNodes[0].AppendChild($template.CreateTextNode('{title}')) | Out-Null; "
-                    f"$textNodes[1].AppendChild($template.CreateTextNode('{message}')) | Out-Null; "
-                    f"$toast = [Windows.UI.Notifications.ToastNotification]::new($template); "
-                    f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Network Monitor').Show($toast);"
-                ]
-                subprocess.run(ps_cmd, capture_output=True, timeout=5)
-            except Exception:
-                # Notification failures should not break monitoring
-                pass
-        except Exception:
-            # Notification failures should not break monitoring
-            pass
+            msg = MIMEMultipart()
+            msg['From'] = self.email_from
+            msg['To'] = ', '.join(self.email_to)
+            msg['Subject'] = subject
+            
+            msg.attach(MIMEText(body, 'plain'))
+            
+            server = smtplib.SMTP(self.email_smtp_server, self.email_smtp_port)
+            if self.email_use_tls:
+                server.starttls()
+            server.login(self.email_username, self.email_password)
+            server.send_message(msg)
+            server.quit()
+            
+            self._log(f"Email alert sent: {subject}")
+        except Exception as e:
+            self._log(f"Failed to send email alert: {str(e)}")
     
     def _check_firewall_rule_exists(self, display_name: str) -> bool:
         """
@@ -419,17 +486,19 @@ class NetworkMonitor:
         except Exception:
             return False
     
-    def _add_firewall_rule(self, entity: str, is_subnet: bool = False) -> bool:
+    def _add_firewall_rule(self, entity: str, is_subnet: bool = False):
         """
         Add a Windows Firewall rule to block the given IP or subnet.
-        Returns True if successful, False otherwise.
+        Returns tuple: (success: bool, was_new_rule: bool, display_name: str)
         """
+        display_name = f"Block_Attacker_{entity.replace('/', '_').replace('.', '_')}"
+        
         if not is_subnet:
             if entity in self.exclude_ips:
                 if entity not in self.logged_skip_entities:
                     self._log(f"FIREWALL_SKIP {entity} (in excluded IPs list)")
                     self.logged_skip_entities.add(entity)
-                return True
+                return (True, False, display_name)
         else:
             subnet_base = entity.split("/")[0]
             octets = subnet_base.split(".")
@@ -443,13 +512,13 @@ class NetworkMonitor:
                             if entity not in self.logged_skip_entities:
                                 self._log(f"FIREWALL_SKIP {entity} (subnet contains excluded IP {excluded_ip})")
                                 self.logged_skip_entities.add(entity)
-                            return True
+                            return (True, False, display_name)
         
         if not platform.system().lower().startswith("win"):
             if entity not in self.logged_skip_entities:
                 self._log(f"FIREWALL_SKIP {entity} (not Windows)")
                 self.logged_skip_entities.add(entity)
-            return False
+            return (False, False, display_name)
         
         try:
             if is_subnet:
@@ -465,14 +534,13 @@ class NetworkMonitor:
             else:
                 remote_address = entity
             
-            display_name = f"Block_Attacker_{entity.replace('/', '_').replace('.', '_')}"
-            
             # Check if rule already exists in Windows Firewall
             if self._check_firewall_rule_exists(display_name):
                 if entity not in self.logged_skip_entities:
                     self._log(f"FIREWALL_SKIP {entity} (rule already exists in Windows Firewall, display_name={display_name})")
                     self.logged_skip_entities.add(entity)
-                return True
+                # Return tuple: (success, was_new_rule, display_name)
+                return (True, False, display_name)
             
             # Create the firewall rule
             cmd = [
@@ -486,17 +554,18 @@ class NetworkMonitor:
             
             if result.returncode == 0:
                 self._log(f"FIREWALL_BLOCKED {entity} remote_address={remote_address} display_name={display_name}")
-                return True
+                # Return tuple: (success, was_new_rule, display_name)
+                return (True, True, display_name)
             else:
                 self._log(f"FIREWALL_ERROR {entity} stderr={result.stderr}")
-                return False
+                return (False, False, display_name)
                 
         except subprocess.TimeoutExpired:
             self._log(f"FIREWALL_TIMEOUT {entity}")
-            return False
+            return (False, False, display_name)
         except Exception as e:
             self._log(f"FIREWALL_EXCEPTION {entity} error={str(e)}")
-            return False
+            return (False, False, display_name)
     
     def _test_firewall_privileges(self) -> bool:
         """
@@ -655,7 +724,15 @@ class NetworkMonitor:
                     if stats_ip.first_suspicious is None:
                         stats_ip.first_suspicious = now
                     stats_ip.last_suspicious = now
-                
+            else:
+                # Decrement suspicion_count when not suspicious (decay mechanism)
+                # Only decrement once per window, and only if suspicion_count > 0
+                if stats_ip.last_suspicious_window_start != window_start_sec and stats_ip.suspicion_count > 0:
+                    stats_ip.suspicion_count -= 1
+                    stats_ip.last_suspicious_window_start = window_start_sec
+            
+            # Calculate severity based on current suspicion_count (can increase or decrease)
+            if stats_ip.suspicion_count > 0:
                 severity = self._classify_severity(
                     packet_count, unique_ports, stats_ip.suspicion_count
                 )
@@ -668,6 +745,24 @@ class NetworkMonitor:
                         f"ATTACK_START IP {src_ip} level=L{severity} "
                         f"first_suspicious={first_ts}"
                     )
+                    
+                    # Send email alert for attack start (only for L4, only once per attack)
+                    if severity >= 4 and src_ip not in self.attack_start_emails_sent:
+                        subject = f"🚨 L4 Attack Detected: {src_ip}"
+                        body = f"""Network Monitor Alert
+
+Attack Start Detected
+IP Address: {src_ip}
+Severity Level: L4 (Critical)
+First Suspicious: {first_ts}
+Current Packets: {packet_count}
+Current Unique Ports: {unique_ports}
+Suspicion Count: {stats_ip.suspicion_count}
+
+This IP has reached the highest severity level (L4) and is being monitored.
+"""
+                        self._send_email_alert(subject, body)
+                        self.attack_start_emails_sent.add(src_ip)
 
             should_alert = False
 
@@ -680,8 +775,31 @@ class NetworkMonitor:
 
             if should_alert:
                 self.detected_ips.add(src_ip)
+                old_level = stats_ip.last_level
                 stats_ip.last_alert = now
                 stats_ip.last_level = severity
+
+                # Detect attack decay: severity decreased from L4 to below L4
+                # Only send email if attack had reached L4 and we sent a start email
+                if old_level >= 4 and severity < 4 and src_ip in self.attack_start_emails_sent:
+                    if src_ip not in self.attack_decay_emails_sent:
+                        subject = f"📉 L4 Attack Decaying: {src_ip}"
+                        body = f"""Network Monitor Alert
+
+Attack Decay Detected
+IP Address: {src_ip}
+Previous Severity Level: L{old_level}
+Current Severity Level: L{severity}
+Suspicion Count: {stats_ip.suspicion_count}
+Time: {now.isoformat()}
+
+The L4 attack from this IP is decaying (severity level decreased).
+"""
+                        self._send_email_alert(subject, body)
+                        self.attack_decay_emails_sent.add(src_ip)
+                elif old_level < 4 and severity >= 4:
+                    # If severity increased back to L4, remove from decay emails so we can send again if it decays
+                    self.attack_decay_emails_sent.discard(src_ip)
 
                 # If severity is at maximum, add to firewall suggestions
                 if severity >= 4:
@@ -692,12 +810,28 @@ class NetworkMonitor:
                         }
                     
                     if self.auto_block:
-                        self._add_firewall_rule(src_ip, is_subnet=False)
+                        blocked, was_new_rule, display_name = self._add_firewall_rule(src_ip, is_subnet=False)
+                        if blocked and was_new_rule and src_ip not in self.firewall_block_emails_sent:
+                            # Send email alert for firewall block (only for newly created rules)
+                            subject = f"🛡️ Firewall Block: {src_ip}"
+                            body = f"""Network Monitor Alert
+
+Action: IP Blocked in Windows Firewall
+IP Address: {src_ip}
+Firewall Rule Name: {display_name}
+Severity Level: L4
+Time: {now.isoformat()}
+
+The IP address has been automatically blocked due to reaching L4 severity level.
+"""
+                            self._send_email_alert(subject, body)
+                            self.firewall_block_emails_sent.add(src_ip)
                 
                 stats_ip.dst_ports.clear()
 
-            # Detect attack end when previously in attack, but now below L3 or no longer suspicious
-            if stats_ip.in_attack and (not base_suspicious or severity < 3):
+            # Detect attack end when previously in attack, but severity has dropped below L3
+            # Severity decreases as suspicion_count decreases (decay mechanism)
+            if stats_ip.in_attack and severity < 3:
                 stats_ip.in_attack = False
                 first_ts = stats_ip.first_suspicious.isoformat() if stats_ip.first_suspicious else "unknown"
                 last_ts = stats_ip.last_suspicious.isoformat() if stats_ip.last_suspicious else "unknown"
@@ -741,7 +875,15 @@ class NetworkMonitor:
                         if stats_subnet.first_suspicious is None:
                             stats_subnet.first_suspicious = now
                         stats_subnet.last_suspicious = now
-                    
+                else:
+                    # Decrement suspicion_count when not suspicious (decay mechanism)
+                    # Only decrement once per window, and only if suspicion_count > 0
+                    if stats_subnet.last_suspicious_window_start != window_start_sec and stats_subnet.suspicion_count > 0:
+                        stats_subnet.suspicion_count -= 1
+                        stats_subnet.last_suspicious_window_start = window_start_sec
+                
+                # Calculate severity based on current suspicion_count (can increase or decrease)
+                if stats_subnet.suspicion_count > 0:
                     subnet_severity = self._classify_severity(
                         subnet_packet_count, subnet_unique_ports, stats_subnet.suspicion_count
                     )
@@ -754,6 +896,24 @@ class NetworkMonitor:
                             f"ATTACK_START SUBNET {subnet_key} level=L{subnet_severity} "
                             f"first_suspicious={first_ts}"
                         )
+                        
+                        # Send email alert for subnet attack start (only for L4, only once per attack)
+                        if subnet_severity >= 4 and subnet_key not in self.attack_start_emails_sent:
+                            subject = f"🚨 L4 Subnet Attack Detected: {subnet_key}"
+                            body = f"""Network Monitor Alert
+
+Attack Start Detected
+Subnet: {subnet_key}
+Severity Level: L4 (Critical)
+First Suspicious: {first_ts}
+Current Packets: {subnet_packet_count}
+Current Unique Ports: {subnet_unique_ports}
+Suspicion Count: {stats_subnet.suspicion_count}
+
+This subnet has reached the highest severity level (L4) and is being monitored.
+"""
+                            self._send_email_alert(subject, body)
+                            self.attack_start_emails_sent.add(subnet_key)
                 subnet_alert = False
 
                 if subnet_severity > 0:
@@ -764,8 +924,31 @@ class NetworkMonitor:
 
                 if subnet_alert:
                     self.detected_subnets.add(subnet_key)
+                    old_subnet_level = stats_subnet.last_level
                     stats_subnet.last_alert = now
                     stats_subnet.last_level = subnet_severity
+
+                    # Detect subnet attack decay: severity decreased from L4 to below L4
+                    # Only send email if attack had reached L4 and we sent a start email
+                    if old_subnet_level >= 4 and subnet_severity < 4 and subnet_key in self.attack_start_emails_sent:
+                        if subnet_key not in self.attack_decay_emails_sent:
+                            subject = f"📉 L4 Subnet Attack Decaying: {subnet_key}"
+                            body = f"""Network Monitor Alert
+
+Attack Decay Detected
+Subnet: {subnet_key}
+Previous Severity Level: L{old_subnet_level}
+Current Severity Level: L{subnet_severity}
+Suspicion Count: {stats_subnet.suspicion_count}
+Time: {now.isoformat()}
+
+The L4 attack from this subnet is decaying (severity level decreased).
+"""
+                            self._send_email_alert(subject, body)
+                            self.attack_decay_emails_sent.add(subnet_key)
+                    elif old_subnet_level < 4 and subnet_severity >= 4:
+                        # If severity increased back to L4, remove from decay emails so we can send again if it decays
+                        self.attack_decay_emails_sent.discard(subnet_key)
 
                     # For a /16, add to firewall suggestions
                     if subnet_severity >= 4:
@@ -775,19 +958,34 @@ class NetworkMonitor:
                                 "is_subnet": True
                             }
                         
-                        # Show Windows notification for L4 subnet attack
-                        self._show_notification(
-                            title="🚨 L4 Subnet Attack Detected",
-                            message=f"Subnet {subnet_key} reached L4 severity\nPackets: {subnet_packet_count}, Ports: {subnet_unique_ports}"
-                        )
-                        
                         if self.auto_block:
-                            self._add_firewall_rule(subnet_key, is_subnet=True)
+                            blocked, was_new_rule, display_name = self._add_firewall_rule(subnet_key, is_subnet=True)
+                            if blocked and was_new_rule:
+                                if subnet_key not in self.firewall_block_emails_sent:
+                                    # Send email alert for subnet firewall block (only for newly created rules)
+                                    subject = f"🛡️ Firewall Block: {subnet_key}"
+                                    body = f"""Network Monitor Alert
+
+Action: Subnet Blocked in Windows Firewall
+Subnet: {subnet_key}
+Firewall Rule Name: {display_name}
+Severity Level: L4
+Time: {now.isoformat()}
+
+The subnet has been automatically blocked due to reaching L4 severity level.
+"""
+                                    self._send_email_alert(subject, body)
+                                    self.firewall_block_emails_sent.add(subnet_key)
+                                else:
+                                    self._log(f"Email alert skipped for {subnet_key} (already sent)")
+                            elif blocked and not was_new_rule:
+                                self._log(f"Email alert skipped for {subnet_key} (rule already existed)")
 
                     stats_subnet.dst_ports.clear()
 
-                # Detect subnet attack end when previously in attack, but now below L3 or no longer suspicious
-                if stats_subnet.in_attack and (not base_suspicious_subnet or subnet_severity < 3):
+                # Detect subnet attack end when previously in attack, but severity has dropped below L3
+                # Severity decreases as suspicion_count decreases (decay mechanism)
+                if stats_subnet.in_attack and subnet_severity < 3:
                     stats_subnet.in_attack = False
                     first_ts = stats_subnet.first_suspicious.isoformat() if stats_subnet.first_suspicious else "unknown"
                     last_ts = stats_subnet.last_suspicious.isoformat() if stats_subnet.last_suspicious else "unknown"
@@ -1040,6 +1238,28 @@ class NetworkMonitor:
 
 def main():
     """Main entry point"""
+    # Load environment variables from .env file if available
+    if DOTENV_AVAILABLE:
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+        if os.path.exists(env_path):
+            load_dotenv(env_path)
+    else:
+        # Fallback: manually load .env file if python-dotenv is not installed
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#') and '=' in line:
+                            key, value = line.split('=', 1)
+                            key = key.strip()
+                            value = value.strip().strip('"').strip("'")
+                            if key and value and key not in os.environ:
+                                os.environ[key] = value
+            except Exception:
+                pass
+    
     parser = argparse.ArgumentParser(
         description="Network Monitor - Real-time malicious IP detection using Npcap"
     )
@@ -1084,6 +1304,48 @@ def main():
         default=None,
         help="IP address(es) to exclude from monitoring (optional, overrides excluded_ips.json). Can be specified multiple times or comma-separated. By default, excluded IPs are loaded from excluded_ips.json file."
     )
+    parser.add_argument(
+        "--email-smtp-server",
+        type=str,
+        default=None,
+        help="SMTP server for email alerts (e.g., smtp.gmail.com, smtp.office365.com)"
+    )
+    parser.add_argument(
+        "--email-smtp-port",
+        type=int,
+        default=587,
+        help="SMTP server port (default: 587 for TLS, use 465 for SSL)"
+    )
+    parser.add_argument(
+        "--email-username",
+        type=str,
+        default=None,
+        help="SMTP username/email address for authentication"
+    )
+    parser.add_argument(
+        "--email-password",
+        type=str,
+        default=None,
+        help="SMTP password (or app password for Gmail/Office365). Can also be set via EMAIL_PASSWORD environment variable."
+    )
+    parser.add_argument(
+        "--email-from",
+        type=str,
+        default=None,
+        help="From email address for alerts"
+    )
+    parser.add_argument(
+        "--email-to",
+        type=str,
+        action="append",
+        default=None,
+        help="Recipient email address(es) for alerts. Can be specified multiple times or comma-separated."
+    )
+    parser.add_argument(
+        "--email-no-tls",
+        action="store_true",
+        help="Disable TLS/SSL for SMTP (not recommended)"
+    )
     args = parser.parse_args()
 
     # Collect exclude IPs from command line arguments (if provided, overrides JSON file)
@@ -1100,13 +1362,46 @@ def main():
         if env_exclude:
             exclude_ips = [ip.strip() for ip in env_exclude.split(",") if ip.strip()]
 
+    # Load email configuration from environment variables (with fallback to command-line args)
+    email_smtp_server = args.email_smtp_server or os.getenv("EMAIL_SMTP_SERVER")
+    email_smtp_port = args.email_smtp_port
+    if os.getenv("EMAIL_SMTP_PORT"):
+        try:
+            email_smtp_port = int(os.getenv("EMAIL_SMTP_PORT"))
+        except ValueError:
+            pass
+    email_username = args.email_username or os.getenv("EMAIL_USERNAME")
+    email_password = args.email_password or os.getenv("EMAIL_PASSWORD")
+    email_from = args.email_from or os.getenv("EMAIL_FROM")
+    
+    # Collect email recipients (from command-line or environment)
+    email_to = None
+    if args.email_to:
+        email_to = []
+        for email_arg in args.email_to:
+            email_to.extend([email.strip() for email in email_arg.split(",") if email.strip()])
+    elif os.getenv("EMAIL_TO"):
+        email_to = [email.strip() for email in os.getenv("EMAIL_TO").split(",") if email.strip()]
+    
+    # Email TLS setting (default True, can be disabled via env var)
+    email_use_tls = not args.email_no_tls
+    if os.getenv("EMAIL_USE_TLS", "").lower() in ("false", "0", "no"):
+        email_use_tls = False
+
     monitor = NetworkMonitor(
         window_seconds=args.window_seconds,
         max_packets=args.max_packets,
         max_ports=args.max_ports,
         alert_cooldown=args.alert_cooldown,
         auto_block=args.auto_block,
-        exclude_ips=exclude_ips
+        exclude_ips=exclude_ips,
+        email_smtp_server=email_smtp_server,
+        email_smtp_port=email_smtp_port,
+        email_username=email_username,
+        email_password=email_password,
+        email_from=email_from,
+        email_to=email_to,
+        email_use_tls=email_use_tls
     )
     monitor.start(interface_id=args.interface)
 

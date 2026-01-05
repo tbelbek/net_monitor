@@ -9,13 +9,15 @@ A Python-based network monitoring tool that uses Npcap to monitor all network tr
 - Four-level severity classification system (L1-L4) with cubic escalation thresholds
 - Automatic Windows Firewall rule creation for L4 threats (optional)
 - Protection against blocking excluded IPs (excluded IPs are never blocked even if they reach L4)
+- **Automatic exclusion of local IPs and WAN IP** (prevents self-blocking)
 - Windows toast notifications for critical subnet attacks
+- **Email alerts for L4 attacks and firewall blocks** (configurable via `.env` file or command-line)
 - Persistent status tracking across restarts
 - Real-time console display with organized severity columns
-- Comprehensive logging to `net_monitor.log`
+- Comprehensive logging to `net_monitor.log` with **daily log rotation**
 - JSON-based status and blocked entity persistence
 - Attack start/end detection and logging
-- IP exclusion support (e.g., exclude host's public IP)
+- IP exclusion support (manual and automatic)
 
 ## Prerequisites
 
@@ -37,7 +39,7 @@ pip install -r requirements.txt
 
 Required packages:
 - `scapy>=2.5.0` - Network packet capture and analysis
-- `win10toast>=0.9` - Windows toast notifications (optional, falls back to PowerShell if unavailable)
+- `python-dotenv>=1.0.0` - Environment variable management (optional, for `.env` file support)
 
 ## Usage
 
@@ -69,6 +71,13 @@ python net_monitor.py [OPTIONS]
 - `--max-ports COUNT` - Maximum unique destination ports per window to trigger suspicion (default: 50)
 - `--alert-cooldown SECONDS` - Seconds between alerts for the same IP (default: 30)
 - `--exclude-ip IP_ADDRESS` - IP address to exclude from monitoring and blocking (e.g., host's public IP). Can be specified multiple times or comma-separated. Can also be set via `EXCLUDE_IP` environment variable. Excluded IPs are loaded from `excluded_ips.json` by default.
+- `--email-smtp-server SERVER` - SMTP server for email alerts (e.g., smtp.gmail.com, smtp.office365.com). Can also be set via `EMAIL_SMTP_SERVER` environment variable or `.env` file.
+- `--email-smtp-port PORT` - SMTP server port (default: 587 for TLS, use 465 for SSL). Can also be set via `EMAIL_SMTP_PORT` environment variable.
+- `--email-username USERNAME` - SMTP username/email address for authentication. Can also be set via `EMAIL_USERNAME` environment variable or `.env` file.
+- `--email-password PASSWORD` - SMTP password (or app password for Gmail/Office365). Can also be set via `EMAIL_PASSWORD` environment variable or `.env` file.
+- `--email-from ADDRESS` - From email address for alerts. Can also be set via `EMAIL_FROM` environment variable or `.env` file.
+- `--email-to ADDRESS` - Recipient email address(es) for alerts. Can be specified multiple times or comma-separated. Can also be set via `EMAIL_TO` environment variable or `.env` file (comma-separated).
+- `--email-no-tls` - Disable TLS/SSL for SMTP (not recommended)
 
 ### Examples
 
@@ -105,6 +114,49 @@ python net_monitor.py
 
 **Note**: Excluded IPs are also loaded from `excluded_ips.json` file. If you specify `--exclude-ip`, it overrides the JSON file. Excluded IPs will never be blocked, even if they reach L4 severity.
 
+**Automatic IP Exclusion:**
+- The tool automatically excludes all local/private IPs (e.g., 192.168.x.x, 10.x.x.x, 172.16-31.x.x)
+- The tool automatically detects and excludes your WAN (public) IP address
+- All server IPs (from all network interfaces) are automatically excluded
+- This prevents false positives and self-blocking scenarios
+
+### Email Alert Configuration
+
+Email alerts can be configured via command-line arguments, environment variables, or a `.env` file (recommended for security).
+
+**Using `.env` file (recommended):**
+
+Create a `.env` file in the same directory as the script:
+
+```env
+EMAIL_SMTP_SERVER=smtp.gmail.com
+EMAIL_SMTP_PORT=587
+EMAIL_USERNAME=your-email@gmail.com
+EMAIL_PASSWORD=your-app-password
+EMAIL_FROM=your-email@gmail.com
+EMAIL_TO=recipient1@example.com,recipient2@example.com
+EMAIL_USE_TLS=true
+```
+
+**Using command-line arguments:**
+
+```bash
+python net_monitor.py \
+  --email-smtp-server smtp.gmail.com \
+  --email-username your-email@gmail.com \
+  --email-password your-app-password \
+  --email-from your-email@gmail.com \
+  --email-to recipient@example.com
+```
+
+**Email Alert Behavior:**
+- **L4 Attack Start**: Email sent once when an IP/subnet reaches L4 severity
+- **L4 Attack End**: Email sent when an L4 attack ends (only if attack start email was sent)
+- **Firewall Block**: Email sent when a new firewall rule is created (only for newly created rules, not existing ones)
+- **L3 and below**: No email alerts (only logged to `net_monitor.log`)
+
+**Note**: For Gmail and Office365, you may need to use an app-specific password instead of your regular password. See your email provider's documentation for details.
+
 ## Detection Criteria
 
 An IP or subnet is flagged as suspicious if it exceeds either threshold within the analysis window:
@@ -125,8 +177,11 @@ Severity is classified based on the number of suspicious windows detected (suspi
 - Alerts are throttled (one per IP per `--alert-cooldown` seconds) to avoid spam
 - Severity escalation triggers immediate alerts regardless of cooldown
 - L3/L4 levels trigger attack start/end detection and logging
+- **L4 attacks trigger email alerts** (if email is configured): one email when attack starts, one when it ends
 - L4 entities are added to firewall suggestions list
-- L4 subnet attacks trigger Windows toast notifications
+
+**Attack End Detection:**
+An attack ends when the entity was previously in attack state (L3 or L4) but the current analysis window no longer exceeds the packet/port thresholds. This means the attack ends when activity drops below `--max-packets` AND `--max-ports` in the current window.
 
 ### Subnet Detection
 
@@ -143,12 +198,21 @@ UTC-timestamped log file containing:
 - Attack start/end events
 - Firewall rule creation attempts
 - Status loading/saving events
+- Email alert status
+- Auto-excluded IPs (local IPs and WAN IP)
+
+**Daily Log Rotation:**
+- Logs are automatically rotated daily at midnight UTC
+- Old logs are renamed to `net_monitor.log.YYYY-MM-DD`
+- If a dated log file already exists, new entries are appended to it
 
 Example log entries:
 ```
-2026-01-05T11:03:31.916087 ATTACK_START IP 98.128.167.1 level=L3 first_suspicious=2026-01-05T11:03:31.916087
-2026-01-05T11:26:58.006932 ATTACK_END IP 98.128.167.1 last_level=L3 duration_sec=1406.09
+2026-01-05T11:03:31.916087 ATTACK_START IP 98.128.167.1 level=L4 first_suspicious=2026-01-05T11:03:31.916087
+2026-01-05T11:26:58.006932 ATTACK_END IP 98.128.167.1 last_level=L4 duration_sec=1406.09
 2026-01-05T11:21:08.516048 FIREWALL_BLOCKED 200.115.0.0/16 remote_address=200.115.0.0-200.115.255.255 display_name=Block_Attacker_200_115_0_0_16
+2026-01-05T11:21:08.516048 EMAIL_ALERT_SENT Firewall block: 200.115.0.0/16
+2026-01-05T00:00:00.000000 AUTO_EXCLUDED_IPS Local IPs: ['192.168.1.100', '10.0.0.5'], WAN IP: 203.0.113.1
 ```
 
 ### `net_monitor_status.json`
@@ -161,11 +225,7 @@ JSON file containing current monitoring status (saved every 60 seconds):
 - Detected IPs and subnets
 - Firewall suggestions
 
-### `blocked_entities.json`
-
-JSON file containing entities that have been blocked via Windows Firewall:
-- List of blocked IPs and subnets
-- Last update timestamp
+**Note**: The tool now queries Windows Firewall directly to check for existing rules, rather than maintaining a separate `blocked_entities.json` file. This ensures consistency with the actual firewall state.
 
 ### `excluded_ips.json`
 
@@ -174,6 +234,16 @@ JSON file containing IP addresses to exclude from monitoring and blocking:
 - Excluded IPs are not monitored for suspicious activity
 - Excluded IPs are never blocked, even if they reach L4 severity
 - Subnets containing excluded IPs are also prevented from being blocked
+
+**Note**: The tool automatically excludes all local/private IPs and the WAN IP, so you typically don't need to manually add them to this file.
+
+### `.env` (optional)
+
+Environment configuration file for email alerts (not committed to version control):
+- Contains SMTP server credentials and email addresses
+- See "Email Alert Configuration" section above for format
+- Create a `.env` file in the same directory as the script
+- **Security**: Never commit `.env` files to version control (already in `.gitignore`)
 
 ## Windows Firewall Integration
 
@@ -185,11 +255,12 @@ When `--auto-block` is enabled, the tool automatically creates Windows Firewall 
 Firewall rules are named: `Block_Attacker_{entity}` (with dots and slashes replaced by underscores)
 
 **Protection Mechanisms:**
-- The tool checks if a rule already exists before creating a new one to avoid duplicates
-- **Excluded IPs are never blocked**: IPs in `excluded_ips.json` or specified via `--exclude-ip` are skipped from firewall rule creation
+- The tool queries Windows Firewall directly to check if a rule already exists before creating a new one (prevents duplicates)
+- **Excluded IPs are never blocked**: IPs in `excluded_ips.json`, specified via `--exclude-ip`, or automatically excluded (local/WAN IPs) are skipped from firewall rule creation
 - **Subnet protection**: Subnets containing excluded IPs are also prevented from being blocked
+- **Email alerts for firewall blocks**: Email notifications are sent only when a new firewall rule is created (not for existing rules)
 
-**Note**: Firewall rule creation requires Administrator privileges and may take a few seconds per rule.
+**Note**: Firewall rule creation requires Administrator privileges and may take a few seconds per rule. The tool performs a privilege check at startup and logs the result.
 
 ## Real-Time Display
 
