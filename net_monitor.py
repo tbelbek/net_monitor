@@ -11,6 +11,8 @@ import time
 import argparse
 import subprocess
 import json
+import socket
+import ipaddress
 from collections import deque, defaultdict
 from datetime import datetime, timedelta
 from threading import Lock, Thread
@@ -52,13 +54,11 @@ class NetworkMonitor:
         self.running = False
         self.display_lock = Lock()
         self.firewall_suggestions = {}  # entity -> {"added": datetime, "is_subnet": bool}
-        self.blocked_entities = set()  # Track already blocked entities
         self.logged_skip_entities = set()  # Track entities that have been logged as skipped
 
         # Log file (in the same directory as this script)
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.log_path = os.path.join(base_dir, "net_monitor.log")
-        self.blocked_file = os.path.join(base_dir, "blocked_entities.json")
         self.status_file = os.path.join(base_dir, "net_monitor_status.json")
         self.excluded_ips_file = os.path.join(base_dir, "excluded_ips.json")
         
@@ -71,8 +71,8 @@ class NetworkMonitor:
             else:
                 self.exclude_ips = set(exclude_ips) if exclude_ips else set()
         
-        # Load previously blocked entities from file
-        self._load_blocked_entities()
+        # Automatically detect and exclude local IPs and WAN IP
+        self._auto_exclude_local_and_wan_ips()
         
         # Load previous status if available
         self._load_status()
@@ -102,29 +102,143 @@ class NetworkMonitor:
             self._log(f"Error loading excluded IPs: {e}")
             self.exclude_ips = set()
     
-    def _load_blocked_entities(self) -> None:
-        """Load previously blocked entities from JSON file."""
+    def _is_private_ip(self, ip: str) -> bool:
+        """Check if an IP address is a private/local IP address."""
         try:
-            if os.path.exists(self.blocked_file):
-                with open(self.blocked_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    self.blocked_entities = set(data.get("blocked", []))
-                    self._log(f"Loaded {len(self.blocked_entities)} previously blocked entities from {self.blocked_file}")
-        except Exception as e:
-            self._log(f"Error loading blocked entities: {e}")
-            self.blocked_entities = set()
+            ip_obj = ipaddress.ip_address(ip)
+            return ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
+        except ValueError:
+            return False
     
-    def _save_blocked_entities(self) -> None:
-        """Save blocked entities to JSON file."""
+    def _get_all_server_ips(self) -> set:
+        """Get all IP addresses (both private and public) from all network interfaces."""
+        server_ips = set()
+        
+        # Get hostname IP
         try:
-            data = {
-                "blocked": sorted(list(self.blocked_entities)),
-                "last_updated": datetime.utcnow().isoformat()
-            }
-            with open(self.blocked_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            self._log(f"Error saving blocked entities: {e}")
+            hostname = socket.gethostname()
+            host_ip = socket.gethostbyname(hostname)
+            server_ips.add(host_ip)
+        except Exception:
+            pass
+        
+        # Get all IPs from network interfaces
+        try:
+            if platform.system().lower().startswith("win"):
+                from scapy.arch.windows import get_windows_if_list
+                win_if_info = get_windows_if_list()
+                for w in win_if_info:
+                    ip = w.get("ip")
+                    if ip:
+                        server_ips.add(ip)
+            else:
+                # On Linux/Unix, use socket to get interface IPs
+                for iface in get_if_list():
+                    try:
+                        # Try to get IP from interface name
+                        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        s.connect(("8.8.8.8", 80))
+                        local_ip = s.getsockname()[0]
+                        s.close()
+                        server_ips.add(local_ip)
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        
+        # Also check all network interfaces using socket
+        try:
+            addrinfo = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+            for info in addrinfo:
+                ip = info[4][0]
+                server_ips.add(ip)
+        except Exception:
+            pass
+        
+        return server_ips
+    
+    def _get_local_ips(self) -> set:
+        """Get all local/private IP addresses from network interfaces."""
+        all_ips = self._get_all_server_ips()
+        return {ip for ip in all_ips if self._is_private_ip(ip)}
+    
+    def _get_wan_ip(self) -> str:
+        """Get the WAN/public IP address of the host."""
+        services = [
+            "https://api.ipify.org",
+            "https://ifconfig.me/ip",
+            "https://icanhazip.com",
+            "https://api.ip.sb/ip",
+            "https://checkip.amazonaws.com",
+            "https://ipinfo.io/ip",
+            "https://ipecho.net/plain",
+            "https://whatismyip.akamai.com",
+            "https://myip.dnsomatic.com"
+        ]
+        
+        for service in services:
+            try:
+                if platform.system().lower().startswith("win"):
+                    cmd = [
+                        "powershell", "-Command",
+                        f"try {{ (Invoke-WebRequest -Uri '{service}' -UseBasicParsing -TimeoutSec 5).Content.Trim() }} catch {{ '' }}"
+                    ]
+                else:
+                    cmd = ["curl", "-s", "--max-time", "5", service]
+                
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+                if result.returncode == 0:
+                    ip = result.stdout.strip()
+                    # Remove any whitespace, newlines, or HTML tags
+                    ip = ip.split()[0] if ip else ""
+                    if ip and not self._is_private_ip(ip):
+                        try:
+                            # Validate it's a proper IP address
+                            ipaddress.ip_address(ip)
+                            self._log(f"Detected WAN IP from {service}: {ip}")
+                            return ip
+                        except ValueError:
+                            continue
+            except subprocess.TimeoutExpired:
+                continue
+            except Exception as e:
+                # Log the error but continue trying other services
+                continue
+        
+        self._log("WAN IP detection failed - could not determine public IP from any service")
+        return None
+    
+    def _auto_exclude_local_and_wan_ips(self) -> None:
+        """Automatically detect and exclude local IPs, server IPs, and WAN IP."""
+        auto_excluded = set()
+        
+        # Get and exclude all server IPs (from all network interfaces)
+        server_ips = self._get_all_server_ips()
+        for ip in server_ips:
+            if ip not in self.exclude_ips:
+                self.exclude_ips.add(ip)
+                auto_excluded.add(ip)
+        
+        if server_ips:
+            newly_excluded = [ip for ip in server_ips if ip in auto_excluded]
+            if newly_excluded:
+                self._log(f"Auto-excluded {len(newly_excluded)} server IP(s): {', '.join(sorted(newly_excluded))}")
+        
+        # Get and exclude WAN IP (public IP from "what is my ip" services)
+        wan_ip = self._get_wan_ip()
+        if wan_ip:
+            if wan_ip not in self.exclude_ips:
+                self.exclude_ips.add(wan_ip)
+                auto_excluded.add(wan_ip)
+                self._log(f"Auto-excluded WAN IP (public IP): {wan_ip}")
+            else:
+                self._log(f"WAN IP {wan_ip} already in exclusion list")
+        else:
+            self._log("WAN IP detection failed - public IP not detected (may already be excluded or services unavailable)")
+        
+        if not auto_excluded:
+            self._log("No additional IPs auto-excluded (server IPs and WAN IP already in exclusion list or not detected)")
     
     def _save_status(self) -> None:
         """Save current monitoring status to JSON file (only active IPs/subnets)."""
@@ -287,17 +401,29 @@ class NetworkMonitor:
             # Notification failures should not break monitoring
             pass
     
+    def _check_firewall_rule_exists(self, display_name: str) -> bool:
+        """
+        Check if a firewall rule with the given display name exists in Windows Firewall.
+        Returns True if the rule exists, False otherwise.
+        """
+        if not platform.system().lower().startswith("win"):
+            return False
+        
+        try:
+            check_cmd = [
+                "powershell", "-Command",
+                f"Get-NetFirewallRule -DisplayName '{display_name}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DisplayName"
+            ]
+            result = subprocess.run(check_cmd, capture_output=True, text=True, timeout=5)
+            return result.returncode == 0 and result.stdout.strip() != ""
+        except Exception:
+            return False
+    
     def _add_firewall_rule(self, entity: str, is_subnet: bool = False) -> bool:
         """
         Add a Windows Firewall rule to block the given IP or subnet.
         Returns True if successful, False otherwise.
         """
-        if entity in self.blocked_entities:
-            if entity not in self.logged_skip_entities:
-                self._log(f"FIREWALL_SKIP {entity} (already in blocked list)")
-                self.logged_skip_entities.add(entity)
-            return True  # Already blocked
-        
         if not is_subnet:
             if entity in self.exclude_ips:
                 if entity not in self.logged_skip_entities:
@@ -342,17 +468,10 @@ class NetworkMonitor:
             display_name = f"Block_Attacker_{entity.replace('/', '_').replace('.', '_')}"
             
             # Check if rule already exists in Windows Firewall
-            check_cmd = [
-                "powershell", "-Command",
-                f"Get-NetFirewallRule -DisplayName '{display_name}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DisplayName"
-            ]
-            result = subprocess.run(check_cmd, capture_output=True, text=True, timeout=5)
-            
-            if result.returncode == 0 and result.stdout.strip():
-                # Rule already exists in Windows Firewall
-                self.blocked_entities.add(entity)
-                self._save_blocked_entities()
-                self._log(f"FIREWALL_EXISTS {entity} (rule already in Windows Firewall, display_name={display_name})")
+            if self._check_firewall_rule_exists(display_name):
+                if entity not in self.logged_skip_entities:
+                    self._log(f"FIREWALL_SKIP {entity} (rule already exists in Windows Firewall, display_name={display_name})")
+                    self.logged_skip_entities.add(entity)
                 return True
             
             # Create the firewall rule
@@ -366,8 +485,6 @@ class NetworkMonitor:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             
             if result.returncode == 0:
-                self.blocked_entities.add(entity)
-                self._save_blocked_entities()
                 self._log(f"FIREWALL_BLOCKED {entity} remote_address={remote_address} display_name={display_name}")
                 return True
             else:
