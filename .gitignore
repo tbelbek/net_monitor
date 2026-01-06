@@ -36,6 +36,7 @@ env/
 # Logs
 *.log
 net_monitor.log
+net_monitor.log.*
 
 # Blocked entities tracking
 blocked_entities.json

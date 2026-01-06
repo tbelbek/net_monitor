@@ -77,8 +77,7 @@ class NetworkMonitor:
         self.firewall_suggestions = {}  # entity -> {"added": datetime, "is_subnet": bool}
         self.logged_skip_entities = set()  # Track entities that have been logged as skipped
         self.firewall_block_emails_sent = set()  # Track entities that have had firewall block emails sent
-        self.attack_start_emails_sent = set()  # Track entities that have had attack start emails sent
-        self.attack_decay_emails_sent = set()  # Track entities that have had attack decay emails sent (to prevent duplicates)
+        self.email_skip_logged = set()  # Track entities for which we've logged email skip messages (to avoid log spam)
 
         # Log file (in the same directory as this script)
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -343,9 +342,7 @@ class NetworkMonitor:
                 "subnet_stats": {},
                 "detected_ips": sorted(list(self.detected_ips)),
                 "detected_subnets": sorted(list(self.detected_subnets)),
-                "firewall_suggestions": {},
-                "attack_start_emails_sent": sorted(list(self.attack_start_emails_sent)),
-                "attack_decay_emails_sent": sorted(list(self.attack_decay_emails_sent))
+                "firewall_suggestions": {}
             }
             
             # Save firewall suggestions
@@ -429,12 +426,6 @@ class NetworkMonitor:
                     "added": datetime.fromisoformat(info_data["added"]),
                     "is_subnet": info_data.get("is_subnet", False)
                 }
-            
-            # Restore attack start emails sent (to prevent duplicate emails after restart)
-            self.attack_start_emails_sent = set(data.get("attack_start_emails_sent", []))
-            
-            # Restore attack decay emails sent (to prevent duplicate emails after restart)
-            self.attack_decay_emails_sent = set(data.get("attack_decay_emails_sent", []))
             
             loaded_ips = len(data.get("ip_stats", {}))
             loaded_subnets = len(data.get("subnet_stats", {}))
@@ -737,33 +728,6 @@ class NetworkMonitor:
                     packet_count, unique_ports, stats_ip.suspicion_count
                 )
 
-                # Detect attack start (only for L3 and L4)
-                if not stats_ip.in_attack and severity >= 3:
-                    stats_ip.in_attack = True
-                    first_ts = stats_ip.first_suspicious.isoformat() if stats_ip.first_suspicious else "unknown"
-                    self._log(
-                        f"ATTACK_START IP {src_ip} level=L{severity} "
-                        f"first_suspicious={first_ts}"
-                    )
-                    
-                    # Send email alert for attack start (only for L4, only once per attack)
-                    if severity >= 4 and src_ip not in self.attack_start_emails_sent:
-                        subject = f"🚨 L4 Attack Detected: {src_ip}"
-                        body = f"""Network Monitor Alert
-
-Attack Start Detected
-IP Address: {src_ip}
-Severity Level: L4 (Critical)
-First Suspicious: {first_ts}
-Current Packets: {packet_count}
-Current Unique Ports: {unique_ports}
-Suspicion Count: {stats_ip.suspicion_count}
-
-This IP has reached the highest severity level (L4) and is being monitored.
-"""
-                        self._send_email_alert(subject, body)
-                        self.attack_start_emails_sent.add(src_ip)
-
             should_alert = False
 
             if severity > 0:
@@ -775,31 +739,8 @@ This IP has reached the highest severity level (L4) and is being monitored.
 
             if should_alert:
                 self.detected_ips.add(src_ip)
-                old_level = stats_ip.last_level
                 stats_ip.last_alert = now
                 stats_ip.last_level = severity
-
-                # Detect attack decay: severity decreased from L4 to below L4
-                # Only send email if attack had reached L4 and we sent a start email
-                if old_level >= 4 and severity < 4 and src_ip in self.attack_start_emails_sent:
-                    if src_ip not in self.attack_decay_emails_sent:
-                        subject = f"📉 L4 Attack Decaying: {src_ip}"
-                        body = f"""Network Monitor Alert
-
-Attack Decay Detected
-IP Address: {src_ip}
-Previous Severity Level: L{old_level}
-Current Severity Level: L{severity}
-Suspicion Count: {stats_ip.suspicion_count}
-Time: {now.isoformat()}
-
-The L4 attack from this IP is decaying (severity level decreased).
-"""
-                        self._send_email_alert(subject, body)
-                        self.attack_decay_emails_sent.add(src_ip)
-                elif old_level < 4 and severity >= 4:
-                    # If severity increased back to L4, remove from decay emails so we can send again if it decays
-                    self.attack_decay_emails_sent.discard(src_ip)
 
                 # If severity is at maximum, add to firewall suggestions
                 if severity >= 4:
@@ -887,33 +828,6 @@ The IP address has been automatically blocked due to reaching L4 severity level.
                     subnet_severity = self._classify_severity(
                         subnet_packet_count, subnet_unique_ports, stats_subnet.suspicion_count
                     )
-
-                    # Detect attack start for subnets (L3/L4)
-                    if not stats_subnet.in_attack and subnet_severity >= 3:
-                        stats_subnet.in_attack = True
-                        first_ts = stats_subnet.first_suspicious.isoformat() if stats_subnet.first_suspicious else "unknown"
-                        self._log(
-                            f"ATTACK_START SUBNET {subnet_key} level=L{subnet_severity} "
-                            f"first_suspicious={first_ts}"
-                        )
-                        
-                        # Send email alert for subnet attack start (only for L4, only once per attack)
-                        if subnet_severity >= 4 and subnet_key not in self.attack_start_emails_sent:
-                            subject = f"🚨 L4 Subnet Attack Detected: {subnet_key}"
-                            body = f"""Network Monitor Alert
-
-Attack Start Detected
-Subnet: {subnet_key}
-Severity Level: L4 (Critical)
-First Suspicious: {first_ts}
-Current Packets: {subnet_packet_count}
-Current Unique Ports: {subnet_unique_ports}
-Suspicion Count: {stats_subnet.suspicion_count}
-
-This subnet has reached the highest severity level (L4) and is being monitored.
-"""
-                            self._send_email_alert(subject, body)
-                            self.attack_start_emails_sent.add(subnet_key)
                 subnet_alert = False
 
                 if subnet_severity > 0:
@@ -924,31 +838,8 @@ This subnet has reached the highest severity level (L4) and is being monitored.
 
                 if subnet_alert:
                     self.detected_subnets.add(subnet_key)
-                    old_subnet_level = stats_subnet.last_level
                     stats_subnet.last_alert = now
                     stats_subnet.last_level = subnet_severity
-
-                    # Detect subnet attack decay: severity decreased from L4 to below L4
-                    # Only send email if attack had reached L4 and we sent a start email
-                    if old_subnet_level >= 4 and subnet_severity < 4 and subnet_key in self.attack_start_emails_sent:
-                        if subnet_key not in self.attack_decay_emails_sent:
-                            subject = f"📉 L4 Subnet Attack Decaying: {subnet_key}"
-                            body = f"""Network Monitor Alert
-
-Attack Decay Detected
-Subnet: {subnet_key}
-Previous Severity Level: L{old_subnet_level}
-Current Severity Level: L{subnet_severity}
-Suspicion Count: {stats_subnet.suspicion_count}
-Time: {now.isoformat()}
-
-The L4 attack from this subnet is decaying (severity level decreased).
-"""
-                            self._send_email_alert(subject, body)
-                            self.attack_decay_emails_sent.add(subnet_key)
-                    elif old_subnet_level < 4 and subnet_severity >= 4:
-                        # If severity increased back to L4, remove from decay emails so we can send again if it decays
-                        self.attack_decay_emails_sent.discard(subnet_key)
 
                     # For a /16, add to firewall suggestions
                     if subnet_severity >= 4:
@@ -977,9 +868,13 @@ The subnet has been automatically blocked due to reaching L4 severity level.
                                     self._send_email_alert(subject, body)
                                     self.firewall_block_emails_sent.add(subnet_key)
                                 else:
-                                    self._log(f"Email alert skipped for {subnet_key} (already sent)")
+                                    if subnet_key not in self.email_skip_logged:
+                                        self._log(f"Email alert skipped for {subnet_key} (already sent)")
+                                        self.email_skip_logged.add(subnet_key)
                             elif blocked and not was_new_rule:
-                                self._log(f"Email alert skipped for {subnet_key} (rule already existed)")
+                                if subnet_key not in self.email_skip_logged:
+                                    self._log(f"Email alert skipped for {subnet_key} (rule already existed)")
+                                    self.email_skip_logged.add(subnet_key)
 
                     stats_subnet.dst_ports.clear()
 

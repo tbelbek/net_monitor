@@ -150,9 +150,8 @@ python net_monitor.py \
 ```
 
 **Email Alert Behavior:**
-- **L4 Attack Start**: Email sent once when an IP/subnet reaches L4 severity
-- **L4 Attack End**: Email sent when an L4 attack ends (only if attack start email was sent)
 - **Firewall Block**: Email sent when a new firewall rule is created (only for newly created rules, not existing ones)
+- All attack start/decay/end events are logged to `net_monitor.log` but do **not** generate emails
 - **L3 and below**: No email alerts (only logged to `net_monitor.log`)
 
 **Note**: For Gmail and Office365, you may need to use an app-specific password instead of your regular password. See your email provider's documentation for details.
