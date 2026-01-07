@@ -17,7 +17,7 @@
     .container { padding: 16px; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
     .grid-two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
-    .last-seen-container { }
+    .last-seen-container { display: block; }
     .card { background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 16px; margin-bottom: 16px; }
     table { width: 100%; border-collapse: collapse; }
     th, td { text-align: left; padding: 8px; border-bottom: 1px solid #e1e4e8; font-size: 14px; }
@@ -27,8 +27,8 @@
     form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     input, textarea { padding: 8px; border: 1px solid #dcdfe6; border-radius: 4px; font-size: 14px; }
     button.primary { background: #1abc9c; color: #fff; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 13px; }
-    button.secondary { background: #ecf0f1; color: #2c3e50; border: 1px solid #d0d7de; padding: 4px 10px; border-radius: 16px; cursor: pointer; font-size: 12px; }
-    button.secondary:hover, button.primary:hover { opacity: 0.9; }
+    button.secondary, a.secondary { background: #ecf0f1; color: #2c3e50; border: 1px solid #d0d7de; padding: 4px 10px; border-radius: 16px; cursor: pointer; font-size: 12px; }
+    button.secondary:hover, button.primary:hover, a.secondary:hover { opacity: 0.9; }
     .hidden { display: none; }
     .filter-container { display: inline-flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-left: 16px; vertical-align: middle; }
     .filter-container label { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #34495e; white-space: nowrap; }
@@ -51,8 +51,9 @@
       <!-- Row 1: time series -->
       <div class="card">
         <h3>Severity Over Time <span id="span-severity" style="font-weight:normal;font-size:12px;color:#7f8c8d;"></span></h3>
+        <p style="margin-top:0; margin-bottom:8px; color:#7f8c8d; font-size:12px;">Historical severity counts per minute (selectable time range)</p>
         <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-          <label>Range:
+          <label>Time Range:
             <select id="history-range">
               <option value="1">Last 1 hour</option>
               <option value="6">Last 6 hours</option>
@@ -71,6 +72,7 @@
       <div class="grid">
         <div class="card">
           <h3>Live Suspicious Traffic <span id="span-live" style="font-weight:normal;font-size:12px;color:#7f8c8d;"></span></h3>
+          <p style="margin-top:0; margin-bottom:8px; color:#7f8c8d; font-size:12px;">Entities currently exceeding thresholds (aggregated over 5 minutes)</p>
           <table id="traffic-table">
             <thead>
               <tr><th>Severity</th><th>Entity</th><th>Packets</th><th>Ports</th><th>Type</th></tr>
@@ -80,10 +82,12 @@
         </div>
         <div class="card">
           <h3>Top Talkers <span id="span-talkers" style="font-weight:normal;font-size:12px;color:#7f8c8d;"></span></h3>
+          <p style="margin-top:0; margin-bottom:8px; color:#7f8c8d; font-size:12px;">Top entities by packet count (aggregated over 5 minutes)</p>
           <canvas id="talkersChart" height="120"></canvas>
         </div>
         <div class="card">
           <h3>Ports Distribution <span id="span-ports" style="font-weight:normal;font-size:12px;color:#7f8c8d;"></span></h3>
+          <p style="margin-top:0; margin-bottom:8px; color:#7f8c8d; font-size:12px;">Most common destination ports (aggregated over 5 minutes)</p>
           <canvas id="portsChart" height="120"></canvas>
         </div>
       </div>
@@ -91,6 +95,7 @@
       <!-- Row 3: last seen -->
       <div class="card">
         <h3>Last Seen IPs and Subnets (24h)</h3>
+        <p style="margin-top:0; margin-bottom:12px; color:#7f8c8d; font-size:12px;">Entities seen in the last 24 hours with cumulative packet counts</p>
         <div class="grid-two" style="margin-bottom:12px;">
           <div>
             <h4>Top IPs (24h)</h4>
@@ -147,6 +152,22 @@
           </form>
         </div>
       </div>
+
+      <!-- Row 5: Packet Samples -->
+      <div class="card">
+        <h3>Packet Samples</h3>
+        <p style="margin-top:0; margin-bottom:12px;">Sample packets captured from suspicious IPs (samples older than 7 days are automatically removed)</p>
+        <div style="margin-bottom:12px;">
+          <p style="color:#7f8c8d; font-size:13px; margin:0;">Use the search box above the table to filter samples by any column.</p>
+        </div>
+        <div id="packet-samples-info" style="margin-bottom:12px; color:#7f8c8d; font-size:13px;"></div>
+        <table id="packet-samples-table">
+          <thead>
+            <tr><th>Timestamp</th><th>Entity</th><th>Protocol</th><th>Destination</th><th>Port</th><th>Size</th><th>Flags</th><th>Indicators</th><th>Actions</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
     </section>
   </div>
 
@@ -157,10 +178,62 @@
     const talkersCtx = document.getElementById('talkersChart').getContext('2d');
     const portsCtx = document.getElementById('portsChart').getContext('2d');
 
+    // Constants for time windows
+    const AGGREGATION_WINDOW_MINUTES = 5; // Backend aggregates data over 5-minute window
+    let analysisWindowSeconds = 10; // Default analysis window, updated from backend
+
+    const commonPorts = {
+      20: 'FTP-DATA', 21: 'FTP', 22: 'SSH', 23: 'TELNET', 25: 'SMTP', 53: 'DNS',
+      67: 'DHCP', 68: 'DHCP', 69: 'TFTP', 80: 'HTTP', 88: 'KERBEROS', 110: 'POP3',
+      111: 'RPC', 119: 'NNTP', 123: 'NTP', 135: 'MSRPC', 139: 'NETBIOS', 143: 'IMAP',
+      161: 'SNMP', 162: 'SNMP', 179: 'BGP', 389: 'LDAP', 443: 'HTTPS', 445: 'SMB',
+      465: 'SMTPS', 514: 'SYSLOG', 515: 'LPD', 587: 'SMTP', 636: 'LDAPS', 993: 'IMAPS',
+      995: 'POP3S', 1080: 'SOCKS', 1433: 'MSSQL', 1521: 'ORACLE', 1723: 'PPTP',
+      3306: 'MYSQL', 3389: 'RDP', 5432: 'POSTGRES', 5900: 'VNC', 6379: 'REDIS',
+      8080: 'HTTP-PROXY', 8443: 'HTTPS-ALT', 8888: 'HTTP-ALT', 9200: 'ELASTICSEARCH',
+      27017: 'MONGODB', 5000: 'UPNP', 5060: 'SIP', 5222: 'XMPP', 6667: 'IRC',
+      8000: 'HTTP-ALT', 9000: 'SONARQUBE', 9092: 'KAFKA'
+    };
+
+    function getPortName(port) {
+      return commonPorts[port] || port.toString();
+    }
+
     let trafficTable = null;
     let recentEntitiesTable = null;
     let exclusionsTable = null;
     let firewallTable = null;
+    let packetSamplesTable = null;
+    let packetSamplesRefreshInterval = null;
+
+    // Performance optimization: debounce/throttle utilities
+    function debounce(func, wait) {
+      let timeout;
+      return function executedFunction(...args) {
+        const later = () => {
+          clearTimeout(timeout);
+          func(...args);
+        };
+        clearTimeout(timeout);
+        timeout = setTimeout(later, wait);
+      };
+    }
+
+    function throttle(func, limit) {
+      let inThrottle;
+      return function(...args) {
+        if (!inThrottle) {
+          func.apply(this, args);
+          inThrottle = true;
+          setTimeout(() => inThrottle = false, limit);
+        }
+      };
+    }
+
+    let lastUpdateTime = 0;
+    const UPDATE_THROTTLE_MS = 500; // Update UI at most every 500ms
+    let pendingUpdate = null;
+    let updateAnimationFrame = null;
 
     const severityChart = new Chart(severityCtx, {
       type: 'line',
@@ -226,22 +299,46 @@
 
     function updateSpanLabels() {
       const label = currentSpanLabel();
-      const windowLabel = `(moving ${WINDOW_MINUTES} min window)`;
+      const aggregationLabel = `(aggregated over ${AGGREGATION_WINDOW_MINUTES} min)`;
       const liveSpan = document.getElementById('span-live');
       const sevSpan = document.getElementById('span-severity');
       const talkSpan = document.getElementById('span-talkers');
       const portsSpan = document.getElementById('span-ports');
-      if (liveSpan) liveSpan.textContent = windowLabel;
+      if (liveSpan) liveSpan.textContent = aggregationLabel;
       if (sevSpan) sevSpan.textContent = `(${label})`;
-      if (talkSpan) talkSpan.textContent = windowLabel;
-      if (portsSpan) portsSpan.textContent = windowLabel;
+      if (talkSpan) talkSpan.textContent = aggregationLabel;
+      if (portsSpan) portsSpan.textContent = aggregationLabel;
     }
 
+    function arraysEqual(a, b) {
+      if (!a || !b || a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) {
+        if (Array.isArray(a[i]) && Array.isArray(b[i])) {
+          if (!arraysEqual(a[i], b[i])) return false;
+        } else if (a[i] !== b[i]) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    const lastTableData = new Map(); // Track last data for each table
+
     function updateDataTable(tableId, tableData, existingTable, options, setTable) {
+      // Check if data actually changed
+      const lastData = lastTableData.get(tableId);
+      if (existingTable && lastData && arraysEqual(lastData, tableData)) {
+        return; // Skip update if data hasn't changed
+      }
+      lastTableData.set(tableId, tableData);
+
       if (existingTable) {
         existingTable.clear();
         existingTable.rows.add(tableData);
-        existingTable.draw();
+        existingTable.draw(false); // Don't reset pagination
+        if (options.drawCallback) {
+          setTimeout(() => options.drawCallback(), 50);
+        }
         return;
       }
       const tbody = document.querySelector(`#${tableId} tbody`);
@@ -257,66 +354,42 @@
         tbody.appendChild(tr);
       });
       const dtOptions = {};
+      const drawCallback = options.drawCallback;
       for (const key in options) {
-        if (key !== 'htmlColumns') {
+        if (key !== 'htmlColumns' && key !== 'drawCallback') {
           dtOptions[key] = options[key];
         }
       }
-      const table = $(`#${tableId}`).DataTable(dtOptions);
-      setTable(table);
-    }
-
-    function updateHistoryBuffer(history, data, key) {
-      const now = Date.now();
-      const cutoff = now - WINDOW_MINUTES * 60 * 1000;
-      history.push({ timestamp: now, data });
-      while (history.length > 0 && history[0].timestamp < cutoff) {
-        history.shift();
+      if (drawCallback) {
+        dtOptions.drawCallback = function() {
+          drawCallback();
+        };
       }
-      saveHistoryToStorage(key, history);
+      const table = $(`#${tableId}`).DataTable(dtOptions);
+      if (setTable) setTable(table);
+      if (drawCallback) drawCallback();
     }
 
     function renderTrafficTable(entries) {
-      updateHistoryBuffer(trafficHistory, entries, 'traffic');
-      
-      // Aggregate entries from the window (keep highest level and sum packets/ports)
-      const entityMap = new Map();
-      trafficHistory.forEach(snapshot => {
-        snapshot.data.forEach(e => {
-          const key = `${e.entity}_${e.type}`;
-          const existing = entityMap.get(key);
-          if (!existing) {
-            entityMap.set(key, {
-              entity: e.entity,
-              type: e.type,
-              level: e.level || 0,
-              packets: e.packets || 0,
-              ports_set: new Set(e.ports_set || []),
-              last_seen: snapshot.timestamp
-            });
-          } else {
-            existing.packets += (e.packets || 0);
-            existing.level = Math.max(existing.level, e.level || 0);
-            if (e.ports_set) {
-              e.ports_set.forEach(p => existing.ports_set.add(p));
-            }
-            existing.last_seen = Math.max(existing.last_seen, snapshot.timestamp);
-          }
-        });
-      });
-      
-      // Convert to array and sort by packets descending
-      const aggregated = Array.from(entityMap.values())
-        .sort((a, b) => b.packets - a.packets)
-        .slice(0, 50); // Limit to top 50
+      // Backend now sends pre-aggregated entries over 5-minute window
+      // No need to aggregate again on frontend, just use the data directly
+      const aggregated = entries.slice(0, 50); // Limit to top 50
       
       const tableData = aggregated.map(e => {
         let portsText = '';
-        if (e.ports_set && e.ports_set.size > 0) {
-          portsText = Array.from(e.ports_set).sort((a, b) => a - b).join(', ');
+        if (e.ports_set && Array.isArray(e.ports_set) && e.ports_set.length > 0) {
+          const ports = e.ports_set; // Already sorted by backend
+          portsText = ports.map(p => {
+            const portName = getPortName(p);
+            // Only show parentheses if port name is different from port number
+            if (portName !== p.toString()) {
+              return `${p} (${portName})`;
+            }
+            return p.toString();
+          }).join(', ');
         }
-        if (portsText.length > 40) {
-          portsText = portsText.slice(0, 37) + '...';
+        if (portsText.length > 60) {
+          portsText = portsText.slice(0, 57) + '...';
         }
         const pillClass = `pill l${e.level || 0}`;
         return [
@@ -350,9 +423,11 @@
 
     function updateSeverityChart(history) {
       const { filtered, enabledLevels } = filterHistory(history);
-      const labels = filtered.map(h => new Date(h.ts).toLocaleTimeString());
+      // Limit history to last 500 points for performance
+      const limitedFiltered = filtered.slice(-500);
+      const labels = limitedFiltered.map(h => new Date(h.ts).toLocaleTimeString());
       const levels = {1: [], 2: [], 3: [], 4: []};
-      filtered.forEach(h => {
+      limitedFiltered.forEach(h => {
         [1,2,3,4].forEach(lvl => {
           levels[lvl].push(enabledLevels.includes(lvl) ? (h.severity?.[lvl] || 0) : 0);
         });
@@ -362,84 +437,8 @@
       severityChart.data.datasets[1].data = levels[2];
       severityChart.data.datasets[2].data = levels[3];
       severityChart.data.datasets[3].data = levels[4];
-      severityChart.update();
+      severityChart.update('none'); // Disable animation for better performance
     }
-
-    // Time-based history buffers for moving timeline
-    const WINDOW_MINUTES = 5; // Show data from last 5 minutes
-    const STORAGE_KEY_PREFIX = 'net_monitor_history_';
-    
-    // Load history from localStorage on page load
-    function loadHistoryFromStorage(key) {
-      try {
-        const stored = localStorage.getItem(STORAGE_KEY_PREFIX + key);
-        if (stored) {
-          const history = JSON.parse(stored);
-          if (Array.isArray(history)) {
-            const now = Date.now();
-            const cutoff = now - WINDOW_MINUTES * 60 * 1000;
-            // Filter out old entries and validate structure
-            return history.filter(item => 
-              item && 
-              typeof item === 'object' && 
-              typeof item.timestamp === 'number' && 
-              item.timestamp >= cutoff &&
-              item.data !== undefined
-            );
-          }
-        }
-      } catch (e) {
-        console.warn('Failed to load history from storage:', e);
-        // Clear corrupted data
-        try {
-          localStorage.removeItem(STORAGE_KEY_PREFIX + key);
-        } catch (e2) {
-          // Ignore
-        }
-      }
-      return [];
-    }
-    
-    // Save history to localStorage (keep only last 10 minutes to avoid storage bloat)
-    function saveHistoryToStorage(key, history) {
-      if (!Array.isArray(history)) {
-        return;
-      }
-      try {
-        const now = Date.now();
-        const maxAge = 10 * 60 * 1000; // 10 minutes
-        const cutoff = now - maxAge;
-        // Filter and validate entries
-        const filtered = history.filter(item => 
-          item && 
-          typeof item === 'object' && 
-          typeof item.timestamp === 'number' && 
-          item.timestamp >= cutoff &&
-          item.data !== undefined
-        );
-        localStorage.setItem(STORAGE_KEY_PREFIX + key, JSON.stringify(filtered));
-      } catch (e) {
-        console.warn('Failed to save history to storage:', e);
-        // If storage is full, try to clear old data
-        try {
-          const keys = Object.keys(localStorage);
-          keys.filter(k => k.startsWith(STORAGE_KEY_PREFIX)).forEach(k => localStorage.removeItem(k));
-        } catch (e2) {
-          // Ignore cleanup errors
-        }
-      }
-    }
-    
-    const talkersHistory = loadHistoryFromStorage('talkers');
-    const portsHistory = loadHistoryFromStorage('ports');
-    const trafficHistory = loadHistoryFromStorage('traffic');
-    
-    // Save history periodically (every 10 seconds)
-    setInterval(() => {
-      saveHistoryToStorage('talkers', talkersHistory);
-      saveHistoryToStorage('ports', portsHistory);
-      saveHistoryToStorage('traffic', trafficHistory);
-    }, 10000);
 
     function ipToSubnet16(ip) {
       // Convert IP to /16 subnet (e.g., 192.168.1.1 -> 192.168.0.0/16)
@@ -451,21 +450,17 @@
     }
 
     function updateTalkersChart(talkers) {
-      updateHistoryBuffer(talkersHistory, talkers, 'talkers');
+      // Backend now sends pre-aggregated talkers over 5-minute window
+      // Filter out entities with 0 packets
+      const filteredTalkers = talkers.filter(t => (t.packets || 0) > 0);
       
-      // Aggregate all entities from the window, preserving type
+      // Build entity map from pre-aggregated data
       const entityMap = new Map(); // entity -> {packets, type}
-      talkersHistory.forEach(snapshot => {
-        snapshot.data.forEach(t => {
-          const entity = t.entity;
-          const packets = t.packets || 0;
-          const type = t.type || (entity.includes('/') ? 'SUBNET' : 'IP');
-          if (entityMap.has(entity)) {
-            entityMap.get(entity).packets += packets;
-          } else {
-            entityMap.set(entity, { packets, type });
-          }
-        });
+      filteredTalkers.forEach(t => {
+        const entity = t.entity;
+        const packets = t.packets || 0;
+        const type = t.type || (entity.includes('/') ? 'SUBNET' : 'IP');
+        entityMap.set(entity, { packets, type });
       });
       
       // Group IPs by subnet - only process IP type entities
@@ -499,7 +494,10 @@
       subnetMap.forEach((ips, subnet) => {
         if (ips.size > 1) {
           // Multiple IPs in subnet - show subnet on axis, IPs stacked
-          multiIPSSubnets.push({ subnet, total: subnetTotals.get(subnet), ips });
+          const total = subnetTotals.get(subnet);
+          if (total > 0) { // Only include subnets with packets
+            multiIPSSubnets.push({ subnet, total, ips });
+          }
         } else {
           // Only one IP in this subnet - show IP directly on axis
           const ip = Array.from(ips.keys())[0];
@@ -568,31 +566,17 @@
       
       talkersChart.data.labels = allLabels;
       talkersChart.data.datasets = datasets;
-      talkersChart.update();
+      talkersChart.update('none'); // Disable animation for better performance
     }
 
     function updatePortsChart(ports) {
-      updateHistoryBuffer(portsHistory, ports, 'ports');
+      // Backend now sends pre-aggregated ports over 5-minute window
+      // Use the data directly, already sorted by count
+      const aggregated = ports.slice(0, 10);
       
-      // Aggregate all ports from the window
-      const portMap = new Map();
-      portsHistory.forEach(snapshot => {
-        snapshot.data.forEach(p => {
-          const port = p.port;
-          const count = p.count || 0;
-          portMap.set(port, (portMap.get(port) || 0) + count);
-        });
-      });
-      
-      // Sort by total count and take top 10
-      const aggregated = Array.from(portMap.entries())
-        .map(([port, count]) => ({ port, count }))
-        .sort((a, b) => b.count - a.count)
-        .slice(0, 10);
-      
-      portsChart.data.labels = aggregated.map(p => p.port);
+      portsChart.data.labels = aggregated.map(p => `${p.port} (${p.port_name || getPortName(p.port)})`);
       portsChart.data.datasets[0].data = aggregated.map(p => p.count);
-      portsChart.update();
+      portsChart.update('none'); // Disable animation for better performance
     }
 
 
@@ -637,11 +621,11 @@
 
       lastIpChart.data.labels = topIps.map(x => x.entity);
       lastIpChart.data.datasets[0].data = topIps.map(x => x.packets || 0);
-      lastIpChart.update();
+      lastIpChart.update('none'); // Disable animation for better performance
 
       lastSubnetChart.data.labels = topSubnets.map(x => x.entity);
       lastSubnetChart.data.datasets[0].data = topSubnets.map(x => x.packets || 0);
-      lastSubnetChart.update();
+      lastSubnetChart.update('none'); // Disable animation for better performance
 
       function attachRecentEntityHandlers() {
         $(document).off('click', '.recent-exclude').on('click', '.recent-exclude', async function() {
@@ -758,20 +742,51 @@ AS: ${data.as || 'N/A'}
       }
     }
 
+    function processWebSocketUpdate(data) {
+      const now = Date.now();
+      if (now - lastUpdateTime < UPDATE_THROTTLE_MS) {
+        // Throttle updates - store pending update
+        pendingUpdate = data;
+        if (!updateAnimationFrame) {
+          updateAnimationFrame = requestAnimationFrame(() => {
+            if (pendingUpdate) {
+              processWebSocketUpdate(pendingUpdate);
+              pendingUpdate = null;
+            }
+            updateAnimationFrame = null;
+          });
+        }
+        return;
+      }
+      lastUpdateTime = now;
+      
+      // Update analysis window from backend if provided
+      if (data.window_seconds) {
+        analysisWindowSeconds = data.window_seconds;
+      }
+      
+      updateSpanLabels();
+      renderTrafficTable(data.entries || []);
+      if (data.severity_history) {
+        updateSeverityChart(data.severity_history);
+      }
+      if (data.top_talkers) updateTalkersChart(data.top_talkers);
+      if (data.top_ports) updatePortsChart(data.top_ports);
+      if (data.recent_entities) renderRecentEntities(data.recent_entities);
+    }
+
     function connectWebSocket() {
       const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/traffic`);
       ws.onmessage = (ev) => {
-        const data = JSON.parse(ev.data);
-        updateSpanLabels();
-        renderTrafficTable(data.entries || []);
-        if (data.severity_history) {
-          updateSeverityChart(data.severity_history);
+        try {
+          const data = JSON.parse(ev.data);
+          processWebSocketUpdate(data);
+        } catch (e) {
+          console.error('Failed to parse WebSocket message:', e);
         }
-        if (data.top_talkers) updateTalkersChart(data.top_talkers);
-        if (data.top_ports) updatePortsChart(data.top_ports);
-        if (data.recent_entities) renderRecentEntities(data.recent_entities);
       };
       ws.onclose = () => setTimeout(connectWebSocket, 2000);
+      ws.onerror = (err) => console.error('WebSocket error:', err);
     }
     connectWebSocket();
 
@@ -807,8 +822,12 @@ AS: ${data.as || 'N/A'}
         if (delRes.ok) loadExclusions();
       });
     }
-    loadExclusions();
-    loadFirewall();
+    
+    // Defer heavy initial loads - load after page is interactive
+    setTimeout(() => {
+      loadExclusions();
+      loadFirewall();
+    }, 1000);
 
     document.getElementById('exclusion-form').addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -881,6 +900,160 @@ AS: ${data.as || 'N/A'}
 
     document.getElementById('refresh-firewall').addEventListener('click', loadFirewall);
 
+    function formatPacketSample(s) {
+      const timestamp = s.timestamp ? new Date(s.timestamp).toLocaleString() : 'N/A';
+      const entity = s.entity || 'N/A';
+      const protocol = s.protocol || 'N/A';
+      const dst = s.dst_ip || 'N/A';
+      
+      let port = 'N/A';
+      if (s.dst_port) {
+        const portName = getPortName(s.dst_port);
+        if (portName !== s.dst_port.toString()) {
+          port = `${s.dst_port} (${portName})`;
+        } else {
+          port = s.dst_port.toString();
+        }
+      }
+      
+      const size = s.packet_size ? `${s.packet_size}B` : 'N/A';
+      
+      let flags = 'N/A';
+      if (s.tcp_flags) {
+        const activeFlags = Object.entries(s.tcp_flags)
+          .filter(([k, v]) => v)
+          .map(([k]) => k);
+        flags = activeFlags.length > 0 ? activeFlags.join(', ') : 'None';
+      }
+      
+      const indicators = [];
+      if (s.suspicious_port) indicators.push('Suspicious Port');
+      if (s.non_standard_privileged_port) indicators.push('Non-Std Privileged');
+      if (s.has_payload && s.payload_size > 1000) indicators.push('Large Payload');
+      const indicatorsText = indicators.length > 0 ? indicators.join(', ') : 'None';
+      
+      const srcIp = s.src_ip || entity;
+      const ipKey = srcIp.replace(/\./g, '_').replace(/\//g, '_');
+      
+      // Show IPinfo result if available
+      let ipinfoDisplay = '';
+      if (s.ipinfo) {
+        const ipinfo = s.ipinfo;
+        if (ipinfo.status === 'safe') {
+          ipinfoDisplay = `<span style="color:#27ae60;font-size:10px;margin-right:4px;" title="IPinfo: ${ipinfo.message}">✓ ${ipinfo.message || 'Safe'}</span>`;
+        } else if (ipinfo.status === 'info') {
+          ipinfoDisplay = `<span style="color:#3498db;font-size:10px;margin-right:4px;" title="IPinfo: ${ipinfo.message}">ℹ ${ipinfo.message || 'Unknown'}</span>`;
+        }
+      }
+      
+      const actionButtons = `
+        <div class="ip-actions" data-ip="${srcIp}" data-key="${ipKey}" style="display:flex;gap:4px;flex-wrap:wrap;align-items:center;">
+          <a href="https://www.abuseipdb.com/check/${srcIp}" target="_blank" class="secondary" style="font-size:11px;padding:4px 8px;text-decoration:none;display:inline-block;">AbuseIPDB</a>
+          <a href="https://www.virustotal.com/gui/ip-address/${srcIp}" target="_blank" class="secondary" style="font-size:11px;padding:4px 8px;text-decoration:none;display:inline-block;">VT</a>
+          <a href="https://ipinfo.io/${srcIp}" target="_blank" class="secondary" style="font-size:11px;padding:4px 8px;text-decoration:none;display:inline-block;">IPinfo</a>
+          <a href="https://www.shodan.io/host/${srcIp}" target="_blank" class="secondary" style="font-size:11px;padding:4px 8px;text-decoration:none;display:inline-block;">Shodan</a>
+          ${ipinfoDisplay}
+        </div>
+      `;
+      
+      return [timestamp, entity, protocol, dst, port, size, flags, indicatorsText, actionButtons];
+    }
+
+    async function loadPacketSamples() {
+      try {
+        // Server-side processing for all samples with search
+        if (!packetSamplesTable) {
+          packetSamplesTable = $('#packet-samples-table').DataTable({
+            order: [[0, 'desc']],
+            pageLength: 25,
+            processing: true,
+            serverSide: true,
+            ajax: {
+              url: '/api/packet-samples',
+              type: 'GET',
+              data: function(d) {
+                // Convert DataTables parameters to our API format
+                const pageSize = d.length || 25;
+                const start = d.start || 0;
+                d.page = Math.floor(start / pageSize) + 1;
+                if (d.page < 1) d.page = 1;
+                d.page_size = pageSize;
+                if (d.page_size < 1) d.page_size = 25;
+                // Pass search value to backend
+                if (d.search && d.search.value) {
+                  d.search_query = d.search.value;
+                }
+                // Remove DataTables-specific parameters
+                delete d.start;
+                delete d.length;
+                delete d.draw;
+                delete d.search;
+                delete d.columns;
+                delete d.order;
+                return d;
+              },
+              dataSrc: function(json) {
+                const totalSamples = json.total_samples || 0;
+                const totalPages = json.total_pages || 1;
+                const currentPage = json.page || 1;
+                const totalEntities = json.total_entities || 0;
+                
+                if (totalSamples === 0) {
+                  document.getElementById('packet-samples-info').textContent = 
+                    'No packet samples found';
+                } else {
+                  document.getElementById('packet-samples-info').textContent = 
+                    `Showing page ${currentPage} of ${totalPages} (${totalSamples} total samples from ${totalEntities} entities)`;
+                }
+                
+                const samples = json.samples || json.data || [];
+                return samples.map(formatPacketSample);
+              },
+              error: function(xhr, error, thrown) {
+                document.getElementById('packet-samples-info').textContent = `Error loading samples: ${thrown || error}`;
+              }
+            },
+            columns: [
+              { title: 'Timestamp' },
+              { title: 'Entity' },
+              { title: 'Protocol' },
+              { title: 'Destination' },
+              { title: 'Port' },
+              { title: 'Size' },
+              { title: 'Flags' },
+              { title: 'Indicators' },
+              { title: 'Actions', orderable: false }
+            ],
+            htmlColumns: [8],
+            drawCallback: function() {
+            }
+          });
+          
+          // Start auto-refresh every 15 seconds
+          if (!packetSamplesRefreshInterval) {
+            packetSamplesRefreshInterval = setInterval(() => {
+              if (packetSamplesTable) {
+                packetSamplesTable.ajax.reload(null, false);
+              }
+            }, 15000);
+          }
+        } else {
+          // Reload existing server-side table
+          packetSamplesTable.ajax.reload(null, false);
+        }
+      } catch (err) {
+        document.getElementById('packet-samples-info').textContent = `Error: ${err.message}`;
+        console.error('Error loading packet samples:', err);
+      }
+    }
+
+
+
+    // Defer packet samples loading - wait until page is fully loaded and other tables are ready
+    setTimeout(() => {
+      loadPacketSamples();
+    }, 2000);
+
     document.getElementById('firewall-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       const entity = document.getElementById('fw-entity').value.trim();
@@ -896,7 +1069,8 @@ AS: ${data.as || 'N/A'}
       }
     });
 
-    setInterval(loadFirewall, 10 * 60 * 1000);
+    // Refresh firewall rules less frequently to reduce load
+    setInterval(loadFirewall, 30 * 60 * 1000); // Every 30 minutes instead of 10
   </script>
 </body>
 </html>
