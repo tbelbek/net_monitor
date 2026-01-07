@@ -11,6 +11,7 @@ import time
 import argparse
 import subprocess
 import json
+import sqlite3
 import socket
 import ipaddress
 import smtplib
@@ -84,6 +85,7 @@ class NetworkMonitor:
         self.log_path = os.path.join(base_dir, "net_monitor.log")
         self.log_dir = base_dir
         self.status_file = os.path.join(base_dir, "net_monitor_status.json")
+        self.status_db_path = os.path.join(base_dir, "net_monitor_status.db")
         self.excluded_ips_file = os.path.join(base_dir, "excluded_ips.json")
         self.last_log_date = None  # Track the date of the current log file
         
@@ -109,6 +111,8 @@ class NetworkMonitor:
         self._initialize_log_rotation()
         
         # Load previous status if available
+        self._ensure_status_db()
+        self._migrate_status_json_to_db()
         self._load_status()
 
     def _initialize_log_rotation(self) -> None:
@@ -205,15 +209,7 @@ class NetworkMonitor:
     def _get_all_server_ips(self) -> set:
         """Get all IP addresses (both private and public) from all network interfaces."""
         server_ips = set()
-        
-        # Get hostname IP
-        try:
-            hostname = socket.gethostname()
-            host_ip = socket.gethostbyname(hostname)
-            server_ips.add(host_ip)
-        except Exception:
-            pass
-        
+
         # Get all IPs from network interfaces
         try:
             if platform.system().lower().startswith("win"):
@@ -224,21 +220,18 @@ class NetworkMonitor:
                     if ip:
                         server_ips.add(ip)
             else:
-                # On Linux/Unix, use socket to get interface IPs
-                for iface in get_if_list():
-                    try:
-                        # Try to get IP from interface name
-                        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                        s.connect(("8.8.8.8", 80))
-                        local_ip = s.getsockname()[0]
-                        s.close()
-                        server_ips.add(local_ip)
-                        break
-                    except Exception:
-                        continue
+                # On Linux/Unix, attempt a single outbound connect to discover primary IP
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.connect(("8.8.8.8", 80))
+                    local_ip = s.getsockname()[0]
+                    s.close()
+                    server_ips.add(local_ip)
+                except Exception:
+                    pass
         except Exception:
             pass
-        
+
         # Also check all network interfaces using socket
         try:
             addrinfo = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
@@ -333,106 +326,285 @@ class NetworkMonitor:
             self._log("No additional IPs auto-excluded (server IPs and WAN IP already in exclusion list or not detected)")
     
     def _save_status(self) -> None:
-        """Save current monitoring status to JSON file (only L4 entities persist between restarts)."""
+        """Persist monitoring status to SQLite (only L4 entities persist)."""
         try:
             now = datetime.utcnow()
-            status_data = {
-                "last_updated": now.isoformat(),
-                "ip_stats": {},
-                "subnet_stats": {},
-                "detected_ips": sorted(list(self.detected_ips)),
-                "detected_subnets": sorted(list(self.detected_subnets)),
-                "firewall_suggestions": {}
-            }
-            
-            # Save firewall suggestions
-            for entity, info in self.firewall_suggestions.items():
-                status_data["firewall_suggestions"][entity] = {
-                    "added": info["added"].isoformat(),
-                    "is_subnet": info["is_subnet"]
-                }
-            
-            # Save IP stats (only L4 entities - suspicion_count >= 1024)
-            for ip, stats in self.stats.items():
-                with stats.lock:
-                    # Only save L4 entities (suspicion_count >= 1024, which is 16 * 4^3)
-                    if stats.suspicion_count >= 1024:
-                        status_data["ip_stats"][ip] = {
-                            "suspicion_count": stats.suspicion_count,
-                            "last_level": stats.last_level,
-                            "first_suspicious": stats.first_suspicious.isoformat() if stats.first_suspicious else None,
-                            "last_suspicious": stats.last_suspicious.isoformat() if stats.last_suspicious else None,
-                            "in_attack": stats.in_attack
-                        }
-            
-            # Save subnet stats (only L4 entities - suspicion_count >= 1024)
-            for subnet, stats in self.subnet_stats.items():
-                with stats.lock:
-                    # Only save L4 entities (suspicion_count >= 1024, which is 16 * 4^3)
-                    if stats.suspicion_count >= 1024:
-                        status_data["subnet_stats"][subnet] = {
-                            "suspicion_count": stats.suspicion_count,
-                            "last_level": stats.last_level,
-                            "first_suspicious": stats.first_suspicious.isoformat() if stats.first_suspicious else None,
-                            "last_suspicious": stats.last_suspicious.isoformat() if stats.last_suspicious else None,
-                            "in_attack": stats.in_attack
-                        }
-            
-            with open(self.status_file, "w", encoding="utf-8") as f:
-                json.dump(status_data, f, indent=2)
+            with sqlite3.connect(self.status_db_path) as conn:
+                conn.execute("BEGIN")
+                conn.execute("DELETE FROM metadata")
+                conn.execute(
+                    "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                    ("last_updated", now.isoformat()),
+                )
+
+                conn.execute("DELETE FROM ip_stats")
+                for ip, stats in self.stats.items():
+                    with stats.lock:
+                        if stats.suspicion_count >= 1024:
+                            conn.execute(
+                                """
+                                INSERT INTO ip_stats (entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    ip,
+                                    stats.suspicion_count,
+                                    stats.last_level,
+                                    stats.first_suspicious.isoformat() if stats.first_suspicious else None,
+                                    stats.last_suspicious.isoformat() if stats.last_suspicious else None,
+                                    1 if stats.in_attack else 0,
+                                ),
+                            )
+
+                conn.execute("DELETE FROM subnet_stats")
+                for subnet, stats in self.subnet_stats.items():
+                    with stats.lock:
+                        if stats.suspicion_count >= 1024:
+                            conn.execute(
+                                """
+                                INSERT INTO subnet_stats (entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    subnet,
+                                    stats.suspicion_count,
+                                    stats.last_level,
+                                    stats.first_suspicious.isoformat() if stats.first_suspicious else None,
+                                    stats.last_suspicious.isoformat() if stats.last_suspicious else None,
+                                    1 if stats.in_attack else 0,
+                                ),
+                            )
+
+                conn.execute("DELETE FROM detected_ips")
+                for ip in self.detected_ips:
+                    conn.execute("INSERT INTO detected_ips (entity) VALUES (?)", (ip,))
+
+                conn.execute("DELETE FROM detected_subnets")
+                for subnet in self.detected_subnets:
+                    conn.execute("INSERT INTO detected_subnets (entity) VALUES (?)", (subnet,))
+
+                conn.execute("DELETE FROM firewall_suggestions")
+                for entity, info in self.firewall_suggestions.items():
+                    conn.execute(
+                        """
+                        INSERT INTO firewall_suggestions (entity, added, is_subnet)
+                        VALUES (?, ?, ?)
+                        """,
+                        (
+                            entity,
+                            info["added"].isoformat(),
+                            1 if info["is_subnet"] else 0,
+                        ),
+                    )
+                conn.commit()
         except Exception as e:
             self._log(f"Error saving status: {e}")
-    
+
     def _load_status(self) -> None:
-        """Load previous monitoring status from JSON file."""
+        """Load previous monitoring status from SQLite store."""
+        try:
+            if not os.path.exists(self.status_db_path):
+                return
+
+            with sqlite3.connect(self.status_db_path) as conn:
+                for ip, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack in conn.execute(
+                    "SELECT entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack FROM ip_stats"
+                ):
+                    stats = self.stats[ip]
+                    with stats.lock:
+                        stats.suspicion_count = suspicion_count or 0
+                        stats.last_level = last_level or 0
+                        if first_suspicious:
+                            stats.first_suspicious = datetime.fromisoformat(first_suspicious)
+                        if last_suspicious:
+                            stats.last_suspicious = datetime.fromisoformat(last_suspicious)
+                        stats.in_attack = bool(in_attack)
+
+                for subnet, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack in conn.execute(
+                    "SELECT entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack FROM subnet_stats"
+                ):
+                    stats = self.subnet_stats[subnet]
+                    with stats.lock:
+                        stats.suspicion_count = suspicion_count or 0
+                        stats.last_level = last_level or 0
+                        if first_suspicious:
+                            stats.first_suspicious = datetime.fromisoformat(first_suspicious)
+                        if last_suspicious:
+                            stats.last_suspicious = datetime.fromisoformat(last_suspicious)
+                        stats.in_attack = bool(in_attack)
+
+                self.detected_ips = {row[0] for row in conn.execute("SELECT entity FROM detected_ips")}
+                self.detected_subnets = {row[0] for row in conn.execute("SELECT entity FROM detected_subnets")}
+
+                for entity, added, is_subnet in conn.execute(
+                    "SELECT entity, added, is_subnet FROM firewall_suggestions"
+                ):
+                    self.firewall_suggestions[entity] = {
+                        "added": datetime.fromisoformat(added),
+                        "is_subnet": bool(is_subnet),
+                    }
+
+                loaded_ips = len(self.stats)
+                loaded_subnets = len(self.subnet_stats)
+                loaded_firewall = len(self.firewall_suggestions)
+                self._log(
+                    f"Loaded status: {loaded_ips} IPs, {loaded_subnets} subnets, {len(self.detected_ips)} detected IPs, "
+                    f"{len(self.detected_subnets)} detected subnets, {loaded_firewall} firewall suggestions"
+                )
+        except Exception as e:
+            self._log(f"Error loading status: {e}")
+
+    def _ensure_status_db(self) -> None:
+        """Create SQLite schema for status storage if missing."""
+        try:
+            with sqlite3.connect(self.status_db_path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ip_stats (
+                        entity TEXT PRIMARY KEY,
+                        suspicion_count INTEGER,
+                        last_level INTEGER,
+                        first_suspicious TEXT,
+                        last_suspicious TEXT,
+                        in_attack INTEGER
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS subnet_stats (
+                        entity TEXT PRIMARY KEY,
+                        suspicion_count INTEGER,
+                        last_level INTEGER,
+                        first_suspicious TEXT,
+                        last_suspicious TEXT,
+                        in_attack INTEGER
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS detected_ips (
+                        entity TEXT PRIMARY KEY
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS detected_subnets (
+                        entity TEXT PRIMARY KEY
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS firewall_suggestions (
+                        entity TEXT PRIMARY KEY,
+                        added TEXT,
+                        is_subnet INTEGER
+                    )
+                    """
+                )
+                conn.commit()
+        except Exception as e:
+            self._log(f"Error initializing status DB: {e}")
+
+    def _migrate_status_json_to_db(self) -> None:
+        """Migrate legacy JSON status file into SQLite once."""
         try:
             if not os.path.exists(self.status_file):
                 return
-            
+
+            # Skip migration if DB already has metadata
+            existing_meta = False
+            if os.path.exists(self.status_db_path):
+                with sqlite3.connect(self.status_db_path) as conn:
+                    row = conn.execute("SELECT COUNT(*) FROM metadata").fetchone()
+                    existing_meta = bool(row and row[0])
+            if existing_meta:
+                return
+
             with open(self.status_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            
-            # Restore IP stats
-            for ip, stats_data in data.get("ip_stats", {}).items():
-                stats = self.stats[ip]
-                with stats.lock:
-                    stats.suspicion_count = stats_data.get("suspicion_count", 0)
-                    stats.last_level = stats_data.get("last_level", 0)
-                    if stats_data.get("first_suspicious"):
-                        stats.first_suspicious = datetime.fromisoformat(stats_data["first_suspicious"])
-                    if stats_data.get("last_suspicious"):
-                        stats.last_suspicious = datetime.fromisoformat(stats_data["last_suspicious"])
-                    stats.in_attack = stats_data.get("in_attack", False)
-            
-            # Restore subnet stats
-            for subnet, stats_data in data.get("subnet_stats", {}).items():
-                stats = self.subnet_stats[subnet]
-                with stats.lock:
-                    stats.suspicion_count = stats_data.get("suspicion_count", 0)
-                    stats.last_level = stats_data.get("last_level", 0)
-                    if stats_data.get("first_suspicious"):
-                        stats.first_suspicious = datetime.fromisoformat(stats_data["first_suspicious"])
-                    if stats_data.get("last_suspicious"):
-                        stats.last_suspicious = datetime.fromisoformat(stats_data["last_suspicious"])
-                    stats.in_attack = stats_data.get("in_attack", False)
-            
-            # Restore detected sets
-            self.detected_ips = set(data.get("detected_ips", []))
-            self.detected_subnets = set(data.get("detected_subnets", []))
-            
-            # Restore firewall suggestions
-            for entity, info_data in data.get("firewall_suggestions", {}).items():
-                self.firewall_suggestions[entity] = {
-                    "added": datetime.fromisoformat(info_data["added"]),
-                    "is_subnet": info_data.get("is_subnet", False)
-                }
-            
-            loaded_ips = len(data.get("ip_stats", {}))
-            loaded_subnets = len(data.get("subnet_stats", {}))
-            loaded_firewall = len(data.get("firewall_suggestions", {}))
-            self._log(f"Loaded status: {loaded_ips} IPs, {loaded_subnets} subnets, {len(self.detected_ips)} detected IPs, {len(self.detected_subnets)} detected subnets, {loaded_firewall} firewall suggestions")
+
+            now_val = data.get("last_updated") or datetime.utcnow().isoformat()
+            with sqlite3.connect(self.status_db_path) as conn:
+                conn.execute("BEGIN")
+                conn.execute("DELETE FROM metadata")
+                conn.execute(
+                    "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                    ("last_updated", now_val),
+                )
+                conn.execute("DELETE FROM ip_stats")
+                for ip, stats_data in data.get("ip_stats", {}).items():
+                    conn.execute(
+                        """
+                        INSERT INTO ip_stats (entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            ip,
+                            stats_data.get("suspicion_count", 0),
+                            stats_data.get("last_level", 0),
+                            stats_data.get("first_suspicious"),
+                            stats_data.get("last_suspicious"),
+                            1 if stats_data.get("in_attack", False) else 0,
+                        ),
+                    )
+
+                conn.execute("DELETE FROM subnet_stats")
+                for subnet, stats_data in data.get("subnet_stats", {}).items():
+                    conn.execute(
+                        """
+                        INSERT INTO subnet_stats (entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            subnet,
+                            stats_data.get("suspicion_count", 0),
+                            stats_data.get("last_level", 0),
+                            stats_data.get("first_suspicious"),
+                            stats_data.get("last_suspicious"),
+                            1 if stats_data.get("in_attack", False) else 0,
+                        ),
+                    )
+
+                conn.execute("DELETE FROM detected_ips")
+                for ip in data.get("detected_ips", []):
+                    conn.execute("INSERT INTO detected_ips (entity) VALUES (?)", (ip,))
+
+                conn.execute("DELETE FROM detected_subnets")
+                for subnet in data.get("detected_subnets", []):
+                    conn.execute("INSERT INTO detected_subnets (entity) VALUES (?)", (subnet,))
+
+                conn.execute("DELETE FROM firewall_suggestions")
+                for entity, info in data.get("firewall_suggestions", {}).items():
+                    conn.execute(
+                        """
+                        INSERT INTO firewall_suggestions (entity, added, is_subnet)
+                        VALUES (?, ?, ?)
+                        """,
+                        (
+                            entity,
+                            info.get("added"),
+                            1 if info.get("is_subnet", False) else 0,
+                        ),
+                    )
+                conn.commit()
+
+            self._log(
+                f"Migrated legacy status JSON to SQLite at {self.status_db_path}"
+            )
         except Exception as e:
-            self._log(f"Error loading status: {e}")
+            self._log(f"Error migrating status JSON to DB: {e}")
     
     def _send_email_alert(self, subject: str, body: str) -> None:
         """Send an email alert."""
@@ -1131,30 +1303,89 @@ The subnet has been automatically blocked due to reaching L4 severity level.
                     print(f"  {ip}")
 
 
-def main():
-    """Main entry point"""
-    # Load environment variables from .env file if available
+def _load_env_file(env_path: str) -> None:
+    """Load environment variables from a .env file using python-dotenv when available."""
     if DOTENV_AVAILABLE:
-        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
         if os.path.exists(env_path):
             load_dotenv(env_path)
-    else:
-        # Fallback: manually load .env file if python-dotenv is not installed
-        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
-        if os.path.exists(env_path):
-            try:
-                with open(env_path, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith('#') and '=' in line:
-                            key, value = line.split('=', 1)
-                            key = key.strip()
-                            value = value.strip().strip('"').strip("'")
-                            if key and value and key not in os.environ:
-                                os.environ[key] = value
-            except Exception:
-                pass
-    
+        return
+
+    if not os.path.exists(env_path):
+        return
+
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key and value and key not in os.environ:
+                        os.environ[key] = value
+    except Exception:
+        pass
+
+
+def _collect_exclude_ips(args):
+    """Merge exclude IPs from CLI args and environment."""
+    exclude_ips = None
+    if args.exclude_ip:
+        exclude_ips = []
+        for ip_arg in args.exclude_ip:
+            exclude_ips.extend([ip.strip() for ip in ip_arg.split(",") if ip.strip()])
+
+    if exclude_ips is None:
+        env_exclude = os.getenv("EXCLUDE_IP")
+        if env_exclude:
+            exclude_ips = [ip.strip() for ip in env_exclude.split(",") if ip.strip()]
+
+    return exclude_ips
+
+
+def _build_email_settings(args) -> dict:
+    """Compose email configuration from args and environment."""
+    smtp_server = args.email_smtp_server or os.getenv("EMAIL_SMTP_SERVER")
+    smtp_port = args.email_smtp_port
+    env_port = os.getenv("EMAIL_SMTP_PORT")
+    if env_port:
+        try:
+            smtp_port = int(env_port)
+        except ValueError:
+            pass
+
+    username = args.email_username or os.getenv("EMAIL_USERNAME")
+    password = args.email_password or os.getenv("EMAIL_PASSWORD")
+    sender = args.email_from or os.getenv("EMAIL_FROM")
+
+    recipients = None
+    if args.email_to:
+        recipients = []
+        for email_arg in args.email_to:
+            recipients.extend([email.strip() for email in email_arg.split(",") if email.strip()])
+    elif os.getenv("EMAIL_TO"):
+        recipients = [email.strip() for email in os.getenv("EMAIL_TO").split(",") if email.strip()]
+
+    use_tls = not args.email_no_tls
+    if os.getenv("EMAIL_USE_TLS", "").lower() in ("false", "0", "no"):
+        use_tls = False
+
+    return {
+        "smtp_server": smtp_server,
+        "smtp_port": smtp_port,
+        "username": username,
+        "password": password,
+        "sender": sender,
+        "recipients": recipients,
+        "use_tls": use_tls,
+    }
+
+
+def main():
+    """Main entry point"""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    _load_env_file(env_path)
+
     parser = argparse.ArgumentParser(
         description="Network Monitor - Real-time malicious IP detection using Npcap"
     )
@@ -1243,45 +1474,8 @@ def main():
     )
     args = parser.parse_args()
 
-    # Collect exclude IPs from command line arguments (if provided, overrides JSON file)
-    exclude_ips = None
-    if args.exclude_ip:
-        exclude_ips = []
-        for ip_arg in args.exclude_ip:
-            # Support comma-separated IPs
-            exclude_ips.extend([ip.strip() for ip in ip_arg.split(",") if ip.strip()])
-    
-    # Check for exclude IPs in environment variable if not provided via command line
-    if exclude_ips is None:
-        env_exclude = os.getenv("EXCLUDE_IP")
-        if env_exclude:
-            exclude_ips = [ip.strip() for ip in env_exclude.split(",") if ip.strip()]
-
-    # Load email configuration from environment variables (with fallback to command-line args)
-    email_smtp_server = args.email_smtp_server or os.getenv("EMAIL_SMTP_SERVER")
-    email_smtp_port = args.email_smtp_port
-    if os.getenv("EMAIL_SMTP_PORT"):
-        try:
-            email_smtp_port = int(os.getenv("EMAIL_SMTP_PORT"))
-        except ValueError:
-            pass
-    email_username = args.email_username or os.getenv("EMAIL_USERNAME")
-    email_password = args.email_password or os.getenv("EMAIL_PASSWORD")
-    email_from = args.email_from or os.getenv("EMAIL_FROM")
-    
-    # Collect email recipients (from command-line or environment)
-    email_to = None
-    if args.email_to:
-        email_to = []
-        for email_arg in args.email_to:
-            email_to.extend([email.strip() for email in email_arg.split(",") if email.strip()])
-    elif os.getenv("EMAIL_TO"):
-        email_to = [email.strip() for email in os.getenv("EMAIL_TO").split(",") if email.strip()]
-    
-    # Email TLS setting (default True, can be disabled via env var)
-    email_use_tls = not args.email_no_tls
-    if os.getenv("EMAIL_USE_TLS", "").lower() in ("false", "0", "no"):
-        email_use_tls = False
+    exclude_ips = _collect_exclude_ips(args)
+    email_settings = _build_email_settings(args)
 
     monitor = NetworkMonitor(
         window_seconds=args.window_seconds,
@@ -1290,13 +1484,13 @@ def main():
         alert_cooldown=args.alert_cooldown,
         auto_block=args.auto_block,
         exclude_ips=exclude_ips,
-        email_smtp_server=email_smtp_server,
-        email_smtp_port=email_smtp_port,
-        email_username=email_username,
-        email_password=email_password,
-        email_from=email_from,
-        email_to=email_to,
-        email_use_tls=email_use_tls
+        email_smtp_server=email_settings["smtp_server"],
+        email_smtp_port=email_settings["smtp_port"],
+        email_username=email_settings["username"],
+        email_password=email_settings["password"],
+        email_from=email_settings["sender"],
+        email_to=email_settings["recipients"],
+        email_use_tls=email_settings["use_tls"],
     )
     monitor.start(interface_id=args.interface)
 
