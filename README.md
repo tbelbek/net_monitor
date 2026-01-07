@@ -6,7 +6,7 @@ A Python-based network monitoring tool that uses Npcap to monitor all network tr
 
 - Real-time network traffic monitoring using Npcap/Scapy
 - Detection of suspicious IPs and /16 subnets based on packet counts and port scanning patterns
-- Four-level severity classification system (L1-L4) with cubic escalation thresholds
+- Four-level severity classification system (L1-L4) with exponential escalation thresholds
 - Automatic Windows Firewall rule creation for L4 threats (optional)
 - Protection against blocking excluded IPs (excluded IPs are never blocked even if they reach L4)
 - **Automatic exclusion of local IPs and WAN IP** (prevents self-blocking)
@@ -15,7 +15,7 @@ A Python-based network monitoring tool that uses Npcap to monitor all network tr
 - Persistent status tracking across restarts
 - Real-time console display with organized severity columns
 - Comprehensive logging to `net_monitor.log` with **daily log rotation**
-- JSON-based status and blocked entity persistence
+- SQLite-based status and excluded IP persistence
 - Attack start/end detection and logging
 - IP exclusion support (manual and automatic)
 
@@ -40,6 +40,8 @@ pip install -r requirements.txt
 Required packages:
 - `scapy>=2.5.0` - Network packet capture and analysis
 - `python-dotenv>=1.0.0` - Environment variable management (optional, for `.env` file support)
+- `fastapi>=0.110.0` - Web framework (optional, for `--web-ui` mode)
+- `uvicorn[standard]>=0.23.0` - ASGI server (optional, for `--web-ui` mode)
 
 ## Usage
 
@@ -70,7 +72,7 @@ python net_monitor.py [OPTIONS]
 - `--max-packets COUNT` - Maximum packets per window to trigger suspicion (default: 20)
 - `--max-ports COUNT` - Maximum unique destination ports per window to trigger suspicion (default: 50)
 - `--alert-cooldown SECONDS` - Seconds between alerts for the same IP (default: 30)
-- `--exclude-ip IP_ADDRESS` - IP address to exclude from monitoring and blocking (e.g., host's public IP). Can be specified multiple times or comma-separated. Can also be set via `EXCLUDE_IP` environment variable. Excluded IPs are loaded from `excluded_ips.json` by default.
+- `--exclude-ip IP_ADDRESS` - IP address to exclude from monitoring and blocking (e.g., host's public IP). Can be specified multiple times or comma-separated. Can also be set via `EXCLUDE_IP` environment variable. Excluded IPs are loaded from SQLite database by default.
 - `--email-smtp-server SERVER` - SMTP server for email alerts (e.g., smtp.gmail.com, smtp.office365.com). Can also be set via `EMAIL_SMTP_SERVER` environment variable or `.env` file.
 - `--email-smtp-port PORT` - SMTP server port (default: 587 for TLS, use 465 for SSL). Can also be set via `EMAIL_SMTP_PORT` environment variable.
 - `--email-username USERNAME` - SMTP username/email address for authentication. Can also be set via `EMAIL_USERNAME` environment variable or `.env` file.
@@ -78,6 +80,8 @@ python net_monitor.py [OPTIONS]
 - `--email-from ADDRESS` - From email address for alerts. Can also be set via `EMAIL_FROM` environment variable or `.env` file.
 - `--email-to ADDRESS` - Recipient email address(es) for alerts. Can be specified multiple times or comma-separated. Can also be set via `EMAIL_TO` environment variable or `.env` file (comma-separated).
 - `--email-no-tls` - Disable TLS/SSL for SMTP (not recommended)
+- `--web-ui` - Run FastAPI-based web UI instead of console display (suitable for Windows service)
+- `--web-port PORT` - HTTP port for web UI (when --web-ui is enabled, default: 8080)
 
 ### Examples
 
@@ -112,7 +116,7 @@ set EXCLUDE_IP=203.0.113.1,192.168.1.1
 python net_monitor.py
 ```
 
-**Note**: Excluded IPs are also loaded from `excluded_ips.json` file. If you specify `--exclude-ip`, it overrides the JSON file. Excluded IPs will never be blocked, even if they reach L4 severity.
+**Note**: Excluded IPs are loaded from SQLite database. If you specify `--exclude-ip`, it overrides the database. Excluded IPs will never be blocked, even if they reach L4 severity.
 
 **Automatic IP Exclusion:**
 - The tool automatically excludes all local/private IPs (e.g., 192.168.x.x, 10.x.x.x, 172.16-31.x.x)
@@ -164,13 +168,15 @@ An IP or subnet is flagged as suspicious if it exceeds either threshold within t
 
 ### Severity Levels
 
-Severity is classified based on the number of suspicious windows detected (suspicion_count), using cubic escalation:
+Severity is classified based on the number of suspicious windows detected (suspicion_count), using exponential escalation with a configurable base value:
 
 - **Level 0**: Below thresholds (no alert)
-- **Level 1 (L1)**: 16+ suspicious windows (16 * 1³ = 16)
-- **Level 2 (L2)**: 128+ suspicious windows (16 * 2³ = 128)
-- **Level 3 (L3)**: 432+ suspicious windows (16 * 3³ = 432)
-- **Level 4 (L4)**: 1024+ suspicious windows (16 * 4³ = 1024)
+- **Level 1 (L1)**: BASE^1 suspicious windows (default: 16)
+- **Level 2 (L2)**: BASE^3 suspicious windows (default: 16³ = 4,096)
+- **Level 3 (L3)**: BASE^6 suspicious windows (default: 16⁶ = 16,777,216)
+- **Level 4 (L4)**: BASE^9 suspicious windows (default: 16⁹ = 68,719,476,736)
+
+The base value (`BASE_SUSPICION_COUNT`) is defined in `net_monitor.py` and can be modified to adjust all thresholds. Threshold values are logged at startup for verification.
 
 **Alert Behavior:**
 - Alerts are throttled (one per IP per `--alert-cooldown` seconds) to avoid spam
@@ -207,34 +213,27 @@ UTC-timestamped log file containing:
 
 Example log entries:
 ```
+2026-01-05T11:00:00.000000 Severity thresholds: L1=16, L2=4096, L3=16777216, L4=68719476736 (BASE=16)
 2026-01-05T11:03:31.916087 ATTACK_START IP 98.128.167.1 level=L4 first_suspicious=2026-01-05T11:03:31.916087
 2026-01-05T11:26:58.006932 ATTACK_END IP 98.128.167.1 last_level=L4 duration_sec=1406.09
 2026-01-05T11:21:08.516048 FIREWALL_BLOCKED 200.115.0.0/16 remote_address=200.115.0.0-200.115.255.255 display_name=Block_Attacker_200_115_0_0_16
-2026-01-05T11:21:08.516048 EMAIL_ALERT_SENT Firewall block: 200.115.0.0/16
-2026-01-05T00:00:00.000000 AUTO_EXCLUDED_IPS Local IPs: ['192.168.1.100', '10.0.0.5'], WAN IP: 203.0.113.1
+2026-01-05T11:21:08.516048 Email alert sent: 🛡️ Firewall Block: 200.115.0.0/16
+2026-01-05T00:00:00.000000 Auto-excluded 2 server IP(s): 192.168.1.100, 10.0.0.5
+2026-01-05T00:00:00.000000 Auto-excluded WAN IP (public IP): 203.0.113.1
 ```
 
-### `net_monitor_status.json`
+### `net_monitor_status.db`
 
-JSON file containing current monitoring status (saved every 60 seconds):
-- Active IP and subnet statistics
+SQLite database containing current monitoring status (saved every 60 seconds):
+- Active IP and subnet statistics (only L4 entities persist)
 - Suspicion counts and severity levels
 - First/last suspicious timestamps
 - Attack state (in_attack flag)
 - Detected IPs and subnets
 - Firewall suggestions
+- Excluded IPs with notes and timestamps
 
-**Note**: The tool now queries Windows Firewall directly to check for existing rules, rather than maintaining a separate `blocked_entities.json` file. This ensures consistency with the actual firewall state.
-
-### `excluded_ips.json`
-
-JSON file containing IP addresses to exclude from monitoring and blocking:
-- List of excluded IP addresses
-- Excluded IPs are not monitored for suspicious activity
-- Excluded IPs are never blocked, even if they reach L4 severity
-- Subnets containing excluded IPs are also prevented from being blocked
-
-**Note**: The tool automatically excludes all local/private IPs and the WAN IP, so you typically don't need to manually add them to this file.
+**Note**: The tool queries Windows Firewall directly to check for existing rules, ensuring consistency with the actual firewall state. Legacy JSON files (`net_monitor_status.json`, `excluded_ips.json`) are automatically migrated to SQLite on first run.
 
 ### `.env` (optional)
 
@@ -292,17 +291,197 @@ Press Ctrl+C to stop.
 
 The tool maintains state across restarts:
 
-- **Status restoration**: On startup, loads previous status from `net_monitor_status.json`
-- **Suspicion count preservation**: Continues counting from previous session
+- **Status restoration**: On startup, loads previous status from `net_monitor_status.db`
+- **Suspicion count preservation**: Continues counting from previous session (L4 entities only)
 - **Blocked entities**: Loads previously blocked entities to avoid duplicate firewall rules
 - **Periodic saves**: Status is saved every 60 seconds and on shutdown
 
 ## Stopping the Monitor
 
 Press `Ctrl+C` to gracefully stop the monitor. The tool will:
-- Save current status to `net_monitor_status.json`
+- Save current status to `net_monitor_status.db`
 - Display summary of detected IPs
 - Clean up threads and resources
+
+## Web UI
+
+The tool includes a web-based dashboard for monitoring and management:
+
+```bash
+python net_monitor.py --web-ui --port 8080
+```
+
+The web UI provides:
+- Real-time traffic visualization with charts
+- Severity history over time
+- Top talkers and port distribution
+- Last seen IPs and subnets (24h)
+- Excluded IPs management
+- Firewall rules management (Windows only)
+- Interactive filtering and search
+
+Access the dashboard at `http://localhost:8080` (or your configured port).
+
+## Running as a Windows Service (NSSM)
+
+The network monitor can be run as a Windows service using NSSM (Non-Sucking Service Manager), allowing it to start automatically on boot and run in the background.
+
+### Prerequisites
+
+1. **Download NSSM**: Download from https://nssm.cc/download
+2. **Extract NSSM**: Extract to a folder (e.g., `C:\nssm`)
+3. **Administrator privileges**: Required for service installation
+
+### Installation Steps
+
+1. **Open Command Prompt as Administrator**
+
+2. **Navigate to NSSM directory**:
+   ```cmd
+   cd C:\nssm\win64
+   ```
+
+3. **Install the service** (replace paths as needed):
+   ```cmd
+   nssm install NetMonitor "C:\Python39\python.exe" "D:\Dev\net_monitor\net_monitor.py --web-ui --web-port 8080 --auto-block -i 0"
+   ```
+
+   **Important parameters:**
+   - `NetMonitor` - Service name (can be any name)
+   - `C:\Python39\python.exe` - Full path to your Python executable
+   - `D:\Dev\net_monitor\net_monitor.py` - Full path to the script
+   - `--web-ui` - Required for service mode (console mode won't work)
+   - `--web-port 8080` - Web UI port (adjust as needed)
+   - `--auto-block` - Enable automatic firewall blocking (optional)
+   - `-i 0` - Interface ID (use `python net_monitor.py` first to find your interface ID)
+
+4. **Configure service settings**:
+   ```cmd
+   nssm set NetMonitor AppDirectory "D:\Dev\net_monitor"
+   nssm set NetMonitor DisplayName "Network Monitor"
+   nssm set NetMonitor Description "Real-time network traffic monitoring and malicious IP detection"
+   ```
+
+5. **Configure service to run as Administrator** (required for packet capture and firewall):
+   ```cmd
+   nssm set NetMonitor ObjectName LocalSystem
+   ```
+   Or use a specific administrator account:
+   ```cmd
+   nssm set NetMonitor ObjectName "DOMAIN\Administrator" "password"
+   ```
+
+6. **Configure logging** (optional but recommended):
+   ```cmd
+   nssm set NetMonitor AppStdout "D:\Dev\net_monitor\nssm_stdout.log"
+   nssm set NetMonitor AppStderr "D:\Dev\net_monitor\nssm_stderr.log"
+   ```
+
+7. **Configure auto-restart** (recommended):
+   ```cmd
+   nssm set NetMonitor AppRestartDelay 5000
+   nssm set NetMonitor AppExit Default Restart
+   ```
+
+8. **Start the service**:
+   ```cmd
+   nssm start NetMonitor
+   ```
+
+### Service Management
+
+**Start service:**
+```cmd
+nssm start NetMonitor
+```
+
+**Stop service:**
+```cmd
+nssm stop NetMonitor
+```
+
+**Restart service:**
+```cmd
+nssm restart NetMonitor
+```
+
+**View service status:**
+```cmd
+nssm status NetMonitor
+```
+
+**Edit service configuration:**
+```cmd
+nssm edit NetMonitor
+```
+
+**Remove service:**
+```cmd
+nssm remove NetMonitor confirm
+```
+
+### Alternative: Using Windows Services Manager
+
+You can also manage the service using Windows Services Manager (`services.msc`):
+- Search for "Services" in Windows Start menu
+- Find "Network Monitor" (or your service name)
+- Right-click to Start/Stop/Restart
+- Right-click → Properties to configure startup type (Automatic/Manual/Disabled)
+
+### Finding Your Interface ID
+
+Before installing the service, determine which network interface to monitor:
+
+1. Run the monitor interactively:
+   ```cmd
+   python net_monitor.py
+   ```
+
+2. Note the interface ID from the list (e.g., `0`, `1`, `2`, etc.)
+
+3. Use this ID in the service installation command with `-i <ID>`
+
+### Configuration via Environment Variables
+
+For service mode, you can use a `.env` file in the script directory for email configuration:
+
+```env
+EMAIL_SMTP_SERVER=smtp.gmail.com
+EMAIL_SMTP_PORT=587
+EMAIL_USERNAME=your-email@gmail.com
+EMAIL_PASSWORD=your-app-password
+EMAIL_FROM=your-email@gmail.com
+EMAIL_TO=recipient@example.com
+```
+
+### Troubleshooting Service Issues
+
+**Service won't start:**
+- Check NSSM logs: `nssm_stdout.log` and `nssm_stderr.log`
+- Verify Python path is correct
+- Verify script path is correct
+- Ensure service account has Administrator privileges
+- Check Windows Event Viewer for service errors
+
+**Can't capture packets:**
+- Service must run as LocalSystem or Administrator account
+- Verify Npcap is installed correctly
+- Check that Npcap is in WinPcap API-compatible mode
+
+**Web UI not accessible:**
+- Verify firewall allows connections on the configured port
+- Check if another service is using the port
+- Review `nssm_stderr.log` for errors
+
+**View real-time logs:**
+```cmd
+type D:\Dev\net_monitor\net_monitor.log
+```
+
+Or use PowerShell to tail the log:
+```powershell
+Get-Content D:\Dev\net_monitor\net_monitor.log -Wait -Tail 50
+```
 
 ## Customization
 
@@ -316,11 +495,28 @@ python net_monitor.py \
   --alert-cooldown 30
 ```
 
+**Severity Threshold Customization:**
+
+The severity thresholds use exponential growth based on `BASE_SUSPICION_COUNT` (default: 16). To change the base value, edit the constant in `net_monitor.py`:
+
+```python
+BASE_SUSPICION_COUNT = 16  # Change this value
+```
+
+All thresholds will be automatically recalculated:
+- L1 = BASE^1
+- L2 = BASE^3
+- L3 = BASE^6
+- L4 = BASE^9
+
+Threshold values are logged at startup for verification.
+
 **Recommended Settings:**
 
 - **High-traffic environments**: Increase `--max-packets` and `--max-ports`
 - **Sensitive environments**: Decrease thresholds for earlier detection
 - **Noisy networks**: Increase `--alert-cooldown` to reduce alert frequency
+- **Adjust severity escalation**: Modify `BASE_SUSPICION_COUNT` to change how quickly entities escalate to higher severity levels
 
 ## Troubleshooting
 
