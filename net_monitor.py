@@ -21,9 +21,20 @@ from email.mime.multipart import MIMEMultipart
 from collections import deque, defaultdict, Counter
 from datetime import datetime, timedelta
 from threading import Lock, Thread
-from typing import Optional
+from typing import Optional, Dict, List, Set, Tuple, Any
 
 from scapy.all import get_if_list, sniff, IP, TCP, UDP
+
+# Constants
+BASE_SUSPICION_COUNT = 8
+L4_SEVERITY_LEVEL = 4
+L3_SEVERITY_LEVEL = 3
+L1_THRESHOLD = BASE_SUSPICION_COUNT  # BASE^1
+L2_THRESHOLD = BASE_SUSPICION_COUNT ** 2  # BASE^3
+L3_THRESHOLD = BASE_SUSPICION_COUNT ** 3  # BASE^6
+L4_THRESHOLD = BASE_SUSPICION_COUNT ** 4  # BASE^9
+FIREWALL_PREFIX = "Block_Attacker_"
+SUBNET_MASK = 16
 
 try:
     from dotenv import load_dotenv
@@ -117,14 +128,17 @@ class NetworkMonitor:
         # Automatically detect and exclude local IPs and WAN IP
         self._auto_exclude_local_and_wan_ips()
         
+        # Initialize log rotation (check if log file exists and get its date)
+        self._initialize_log_rotation()
+        
+        # Log threshold configuration
+        self._log(f"Severity thresholds: L1={L1_THRESHOLD}, L2={L2_THRESHOLD}, L3={L3_THRESHOLD}, L4={L4_THRESHOLD} (BASE={BASE_SUSPICION_COUNT})")
+        
         # Log email configuration status
         if self.email_enabled:
             self._log(f"Email alerts enabled: SMTP={self.email_smtp_server}:{self.email_smtp_port}, From={self.email_from}, To={', '.join(self.email_to)}")
         else:
             self._log("Email alerts disabled (email configuration not provided)")
-        
-        # Initialize log rotation (check if log file exists and get its date)
-        self._initialize_log_rotation()
         
         # Load previous status if available
         self._migrate_status_json_to_db()
@@ -200,7 +214,7 @@ class NetworkMonitor:
             # Logging failures should not break monitoring
             pass
     
-    def _load_excluded_ips_from_db(self) -> set:
+    def _load_excluded_ips_from_db(self) -> Set[str]:
         """Load excluded IPs from SQLite table."""
         try:
             with sqlite3.connect(self.status_db_path) as conn:
@@ -209,7 +223,7 @@ class NetworkMonitor:
                 if ips:
                     self._log(f"Loaded {len(ips)} excluded IPs from SQLite")
                 return ips
-        except Exception as e:
+        except (sqlite3.Error, OSError) as e:
             self._log(f"Error loading excluded IPs from SQLite: {e}")
             return set()
     
@@ -221,7 +235,7 @@ class NetworkMonitor:
         except ValueError:
             return False
     
-    def _get_all_server_ips(self) -> set:
+    def _get_all_server_ips(self) -> Set[str]:
         """Get all IP addresses (both private and public) from all network interfaces."""
         server_ips = set()
 
@@ -258,12 +272,12 @@ class NetworkMonitor:
         
         return server_ips
     
-    def _get_local_ips(self) -> set:
+    def _get_local_ips(self) -> Set[str]:
         """Get all local/private IP addresses from network interfaces."""
         all_ips = self._get_all_server_ips()
         return {ip for ip in all_ips if self._is_private_ip(ip)}
     
-    def _get_wan_ip(self) -> str:
+    def _get_wan_ip(self) -> Optional[str]:
         """Get the WAN/public IP address of the host."""
         services = [
             "https://api.ipify.org",
@@ -340,6 +354,35 @@ class NetworkMonitor:
         if not auto_excluded:
             self._log("No additional IPs auto-excluded (server IPs and WAN IP already in exclusion list or not detected)")
     
+    def _save_stats_to_db(
+        self, conn: sqlite3.Connection, stats_dict: Dict[str, IpStats], table_name: str
+    ) -> None:
+        """Save stats dictionary to database table."""
+        conn.execute(f"DELETE FROM {table_name}")
+        for entity, stats in stats_dict.items():
+            with stats.lock:
+                if stats.suspicion_count >= L4_THRESHOLD:
+                    conn.execute(
+                        f"""
+                        INSERT INTO {table_name} (entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            entity,
+                            stats.suspicion_count,
+                            stats.last_level,
+                            stats.first_suspicious.isoformat() if stats.first_suspicious else None,
+                            stats.last_suspicious.isoformat() if stats.last_suspicious else None,
+                            1 if stats.in_attack else 0,
+                        ),
+                    )
+
+    def _save_detected_entities(self, conn: sqlite3.Connection, entities: Set[str], table_name: str) -> None:
+        """Save detected entities to database table."""
+        conn.execute(f"DELETE FROM {table_name}")
+        for entity in entities:
+            conn.execute(f"INSERT INTO {table_name} (entity) VALUES (?)", (entity,))
+
     def _save_status(self) -> None:
         """Persist monitoring status to SQLite (only L4 entities persist)."""
         try:
@@ -352,51 +395,10 @@ class NetworkMonitor:
                     ("last_updated", now.isoformat()),
                 )
 
-                conn.execute("DELETE FROM ip_stats")
-                for ip, stats in self.stats.items():
-                    with stats.lock:
-                        if stats.suspicion_count >= 1024:
-                            conn.execute(
-                                """
-                                INSERT INTO ip_stats (entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack)
-                                VALUES (?, ?, ?, ?, ?, ?)
-                                """,
-                                (
-                                    ip,
-                                    stats.suspicion_count,
-                                    stats.last_level,
-                                    stats.first_suspicious.isoformat() if stats.first_suspicious else None,
-                                    stats.last_suspicious.isoformat() if stats.last_suspicious else None,
-                                    1 if stats.in_attack else 0,
-                                ),
-                            )
-
-                conn.execute("DELETE FROM subnet_stats")
-                for subnet, stats in self.subnet_stats.items():
-                    with stats.lock:
-                        if stats.suspicion_count >= 1024:
-                            conn.execute(
-                                """
-                                INSERT INTO subnet_stats (entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack)
-                                VALUES (?, ?, ?, ?, ?, ?)
-                                """,
-                                (
-                                    subnet,
-                                    stats.suspicion_count,
-                                    stats.last_level,
-                                    stats.first_suspicious.isoformat() if stats.first_suspicious else None,
-                                    stats.last_suspicious.isoformat() if stats.last_suspicious else None,
-                                    1 if stats.in_attack else 0,
-                                ),
-                            )
-
-                conn.execute("DELETE FROM detected_ips")
-                for ip in self.detected_ips:
-                    conn.execute("INSERT INTO detected_ips (entity) VALUES (?)", (ip,))
-
-                conn.execute("DELETE FROM detected_subnets")
-                for subnet in self.detected_subnets:
-                    conn.execute("INSERT INTO detected_subnets (entity) VALUES (?)", (subnet,))
+                self._save_stats_to_db(conn, self.stats, "ip_stats")
+                self._save_stats_to_db(conn, self.subnet_stats, "subnet_stats")
+                self._save_detected_entities(conn, self.detected_ips, "detected_ips")
+                self._save_detected_entities(conn, self.detected_subnets, "detected_subnets")
 
                 conn.execute("DELETE FROM firewall_suggestions")
                 for entity, info in self.firewall_suggestions.items():
@@ -412,8 +414,25 @@ class NetworkMonitor:
                         ),
                     )
                 conn.commit()
-        except Exception as e:
+        except (sqlite3.Error, OSError) as e:
             self._log(f"Error saving status: {e}")
+
+    def _load_stats_from_db(
+        self, conn: sqlite3.Connection, stats_dict: Dict[str, IpStats], table_name: str
+    ) -> None:
+        """Load stats from database table into stats dictionary."""
+        for entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack in conn.execute(
+            f"SELECT entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack FROM {table_name}"
+        ):
+            stats = stats_dict[entity]
+            with stats.lock:
+                stats.suspicion_count = suspicion_count or 0
+                stats.last_level = last_level or 0
+                if first_suspicious:
+                    stats.first_suspicious = datetime.fromisoformat(first_suspicious)
+                if last_suspicious:
+                    stats.last_suspicious = datetime.fromisoformat(last_suspicious)
+                stats.in_attack = bool(in_attack)
 
     def _load_status(self) -> None:
         """Load previous monitoring status from SQLite store."""
@@ -422,31 +441,8 @@ class NetworkMonitor:
                 return
 
             with sqlite3.connect(self.status_db_path) as conn:
-                for ip, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack in conn.execute(
-                    "SELECT entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack FROM ip_stats"
-                ):
-                    stats = self.stats[ip]
-                    with stats.lock:
-                        stats.suspicion_count = suspicion_count or 0
-                        stats.last_level = last_level or 0
-                        if first_suspicious:
-                            stats.first_suspicious = datetime.fromisoformat(first_suspicious)
-                        if last_suspicious:
-                            stats.last_suspicious = datetime.fromisoformat(last_suspicious)
-                        stats.in_attack = bool(in_attack)
-
-                for subnet, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack in conn.execute(
-                    "SELECT entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack FROM subnet_stats"
-                ):
-                    stats = self.subnet_stats[subnet]
-                    with stats.lock:
-                        stats.suspicion_count = suspicion_count or 0
-                        stats.last_level = last_level or 0
-                        if first_suspicious:
-                            stats.first_suspicious = datetime.fromisoformat(first_suspicious)
-                        if last_suspicious:
-                            stats.last_suspicious = datetime.fromisoformat(last_suspicious)
-                        stats.in_attack = bool(in_attack)
+                self._load_stats_from_db(conn, self.stats, "ip_stats")
+                self._load_stats_from_db(conn, self.subnet_stats, "subnet_stats")
 
                 self.detected_ips = {row[0] for row in conn.execute("SELECT entity FROM detected_ips")}
                 self.detected_subnets = {row[0] for row in conn.execute("SELECT entity FROM detected_subnets")}
@@ -466,7 +462,7 @@ class NetworkMonitor:
                     f"Loaded status: {loaded_ips} IPs, {loaded_subnets} subnets, {len(self.detected_ips)} detected IPs, "
                     f"{len(self.detected_subnets)} detected subnets, {loaded_firewall} firewall suggestions"
                 )
-        except Exception as e:
+        except (sqlite3.Error, OSError, ValueError) as e:
             self._log(f"Error loading status: {e}")
 
     def _ensure_status_db(self) -> None:
@@ -664,7 +660,7 @@ class NetworkMonitor:
         except Exception as e:
             self._log(f"Error migrating excluded IPs JSON to DB: {e}")
 
-    def list_excluded_ips(self):
+    def list_excluded_ips(self) -> List[Dict[str, Optional[str]]]:
         """Return all excluded IPs with metadata."""
         try:
             with sqlite3.connect(self.status_db_path) as conn:
@@ -674,11 +670,11 @@ class NetworkMonitor:
                 return [
                     {"ip": row[0], "note": row[1], "created_at": row[2]} for row in rows
                 ]
-        except Exception as e:
+        except (sqlite3.Error, OSError) as e:
             self._log(f"Error listing excluded IPs: {e}")
             return []
 
-    def add_excluded_ip(self, ip: str, note: str = None) -> bool:
+    def add_excluded_ip(self, ip: str, note: Optional[str] = None) -> bool:
         """Add or update an excluded IP in SQLite and in-memory set."""
         try:
             ipaddress.ip_address(ip)
@@ -763,12 +759,12 @@ class NetworkMonitor:
         except Exception:
             return False
     
-    def _add_firewall_rule(self, entity: str, is_subnet: bool = False):
+    def _add_firewall_rule(self, entity: str, is_subnet: bool = False) -> Tuple[bool, bool, str]:
         """
         Add a Windows Firewall rule to block the given IP or subnet.
         Returns tuple: (success: bool, was_new_rule: bool, display_name: str)
         """
-        display_name = f"Block_Attacker_{entity.replace('/', '_').replace('.', '_')}"
+        display_name = f"{FIREWALL_PREFIX}{entity.replace('/', '_').replace('.', '_')}"
         
         if not is_subnet:
             if entity in self.exclude_ips:
@@ -844,7 +840,7 @@ class NetworkMonitor:
             self._log(f"FIREWALL_EXCEPTION {entity} error={str(e)}")
             return (False, False, display_name)
     
-    def list_firewall_rules(self, prefix: str = "Block_Attacker_"):
+    def list_firewall_rules(self, prefix: str = FIREWALL_PREFIX) -> List[Dict[str, Any]]:
         """List Windows Firewall rules matching the provided display name prefix."""
         if not platform.system().lower().startswith("win"):
             return []
@@ -959,7 +955,7 @@ class NetworkMonitor:
             return False
         
         test_ip = "192.0.2.1"  # Test-Net IP (RFC 5737) - safe to use for testing
-        display_name = f"Block_Attacker_TEST_PRIV_CHECK"
+        display_name = f"{FIREWALL_PREFIX}TEST_PRIV_CHECK"
         
         try:
             # Try to create a test firewall rule
@@ -1016,38 +1012,139 @@ class NetworkMonitor:
     def _classify_severity(self, packet_count: int, unique_ports: int, suspicion_count: int) -> int:
         """
         Classify severity into 4 levels based only on history (suspicion count),
-        with cubic growth starting from 16.
+        with exponential growth starting from BASE_SUSPICION_COUNT.
         Level 0: below thresholds (no alert)
         Level 1-4: more windows flagged as suspicious => higher level.
-        Cubic thresholds: 16 * n^3 where n is the level multiplier
+        Exponential thresholds: BASE^(1), BASE^(3), BASE^(6), BASE^(9)
         """
-        if suspicion_count < 16:
+        if suspicion_count < L1_THRESHOLD:
             return 0
 
-        # Cubic escalation starting from 16:
-        #  Base: 16
-        #  L1: 16 * 1^3 = 16 suspicious windows
-        #  L2: 16 * 2^3 = 128 suspicious windows
-        #  L3: 16 * 3^3 = 432 suspicious windows
-        #  L4: 16 * 4^3 = 1024 suspicious windows
-        if suspicion_count >= 1024:  # 16 * 4^3
+        if suspicion_count >= L4_THRESHOLD:
             return 4
-        if suspicion_count >= 432:  # 16 * 3^3
+        if suspicion_count >= L3_THRESHOLD:
             return 3
-        if suspicion_count >= 128:  # 16 * 2^3
+        if suspicion_count >= L2_THRESHOLD:
             return 2
-        if suspicion_count >= 16:  # 16 * 1^3
-            return 1
-        return 0
+        return 1
 
-    def _get_subnet_key(self, ip: str):
+    def _get_subnet_key(self, ip: str) -> Optional[str]:
         """Return a simple /16 subnet key (A.B.0.0/16) for IPv4 addresses, or None if not IPv4."""
         parts = ip.split(".")
         if len(parts) != 4:
             return None
-        return f"{parts[0]}.{parts[1]}.0.0/16"
+        return f"{parts[0]}.{parts[1]}.0.0/{SUBNET_MASK}"
 
-    def process_packet(self, packet):
+    def _process_entity_stats(
+        self,
+        stats: IpStats,
+        entity: str,
+        now: datetime,
+        dst_port: Optional[int],
+        detected_set: Set[str],
+        firewall_suggestions: Dict[str, Dict[str, Any]],
+        is_subnet: bool = False
+    ) -> Tuple[int, bool]:
+        """
+        Process statistics for an entity (IP or subnet) and determine severity and alert status.
+        Returns: (severity, should_alert)
+        """
+        with stats.lock:
+            stats.packet_times.append(now)
+            if dst_port:
+                stats.dst_ports.add(dst_port)
+            
+            while stats.packet_times and now - stats.packet_times[0] > self.window:
+                stats.packet_times.popleft()
+            
+            packet_count = len(stats.packet_times)
+            unique_ports = len(stats.dst_ports)
+            base_suspicious = packet_count >= self.max_packets or unique_ports >= self.max_ports
+            window_start_sec = int(now.timestamp())
+            
+            severity = 0
+            if base_suspicious:
+                if stats.last_suspicious_window_start != window_start_sec:
+                    stats.suspicion_count += 1
+                    stats.last_suspicious_window_start = window_start_sec
+                    if stats.first_suspicious is None:
+                        stats.first_suspicious = now
+                    stats.last_suspicious = now
+            else:
+                if stats.last_suspicious_window_start != window_start_sec and stats.suspicion_count > 0:
+                    stats.suspicion_count -= 1
+                    stats.last_suspicious_window_start = window_start_sec
+            
+            if stats.suspicion_count > 0:
+                severity = self._classify_severity(packet_count, unique_ports, stats.suspicion_count)
+            
+            should_alert = False
+            if severity > 0:
+                if severity > stats.last_level:
+                    should_alert = True
+                elif stats.last_alert is None or now - stats.last_alert > self.alert_cooldown:
+                    should_alert = True
+            
+            if should_alert:
+                detected_set.add(entity)
+                stats.last_alert = now
+                stats.last_level = severity
+                
+                if severity >= L4_SEVERITY_LEVEL:
+                    if entity not in firewall_suggestions:
+                        firewall_suggestions[entity] = {
+                            "added": now,
+                            "is_subnet": is_subnet
+                        }
+                
+                stats.dst_ports.clear()
+            
+            if stats.in_attack and severity < L3_SEVERITY_LEVEL:
+                stats.in_attack = False
+                first_ts = stats.first_suspicious.isoformat() if stats.first_suspicious else "unknown"
+                last_ts = stats.last_suspicious.isoformat() if stats.last_suspicious else "unknown"
+                duration_sec = 0.0
+                if stats.first_suspicious and stats.last_suspicious:
+                    duration_sec = (stats.last_suspicious - stats.first_suspicious).total_seconds()
+                
+                entity_type = "SUBNET" if is_subnet else "IP"
+                self._log(
+                    f"ATTACK_END {entity_type} {entity} last_level=L{stats.last_level} "
+                    f"first_suspicious={first_ts} last_suspicious={last_ts} "
+                    f"duration_sec={duration_sec:.2f}"
+                )
+            
+            return severity, should_alert
+
+    def _handle_firewall_block(self, entity: str, is_subnet: bool, now: datetime) -> None:
+        """Handle firewall blocking and email alerts for L4 entities."""
+        if not self.auto_block:
+            return
+        
+        blocked, was_new_rule, display_name = self._add_firewall_rule(entity, is_subnet=is_subnet)
+        
+        if blocked and was_new_rule:
+            if entity not in self.firewall_block_emails_sent:
+                entity_type = "Subnet" if is_subnet else "IP"
+                subject = f"🛡️ Firewall Block: {entity}"
+                body = f"""Network Monitor Alert
+
+Action: {entity_type} Blocked in Windows Firewall
+{'Subnet' if is_subnet else 'IP Address'}: {entity}
+Firewall Rule Name: {display_name}
+Severity Level: L4
+Time: {now.isoformat()}
+
+The {entity_type.lower()} has been automatically blocked due to reaching L4 severity level.
+"""
+                self._send_email_alert(subject, body)
+                self.firewall_block_emails_sent.add(entity)
+        elif blocked and not was_new_rule:
+            if entity not in self.email_skip_logged:
+                self._log(f"Email alert skipped for {entity} (rule already existed)")
+                self.email_skip_logged.add(entity)
+
+    def process_packet(self, packet: Any) -> None:
         """Process a captured packet"""
         if not packet.haslayer(IP):
             return
@@ -1071,221 +1168,28 @@ class NetworkMonitor:
         
         now = datetime.utcnow()
 
-        # Per-IP statistics
         stats_ip = self.stats[src_ip]
         subnet_key = self._get_subnet_key(src_ip)
         stats_subnet = self.subnet_stats[subnet_key] if subnet_key else None
         
-        # Update per-IP stats and check
-        with stats_ip.lock:
-            stats_ip.packet_times.append(now)
-            if dst_port:
-                stats_ip.dst_ports.add(dst_port)
-            
-            while stats_ip.packet_times and now - stats_ip.packet_times[0] > self.window:
-                stats_ip.packet_times.popleft()
-            
-            packet_count = len(stats_ip.packet_times)
-            unique_ports = len(stats_ip.dst_ports)
+        severity, should_alert = self._process_entity_stats(
+            stats_ip, src_ip, now, dst_port,
+            self.detected_ips, self.firewall_suggestions, is_subnet=False
+        )
+        
+        if should_alert and severity >= L4_SEVERITY_LEVEL:
+            self._handle_firewall_block(src_ip, is_subnet=False, now=now)
 
-            # Base condition for being considered suspicious in this window
-            base_suspicious = (
-                packet_count >= self.max_packets or unique_ports >= self.max_ports
-            )
-
-            # Calculate current window start time (rounded down to 1-second boundary)
-            window_start_sec = int(now.timestamp())
-
-            severity = 0
-            if base_suspicious:
-                # Only increment suspicion_count once per window, not per packet
-                if stats_ip.last_suspicious_window_start != window_start_sec:
-                    stats_ip.suspicion_count += 1
-                    stats_ip.last_suspicious_window_start = window_start_sec
-                    # Track first/last time this IP was seen as suspicious
-                    if stats_ip.first_suspicious is None:
-                        stats_ip.first_suspicious = now
-                    stats_ip.last_suspicious = now
-            else:
-                # Decrement suspicion_count when not suspicious (decay mechanism)
-                # Only decrement once per window, and only if suspicion_count > 0
-                if stats_ip.last_suspicious_window_start != window_start_sec and stats_ip.suspicion_count > 0:
-                    stats_ip.suspicion_count -= 1
-                    stats_ip.last_suspicious_window_start = window_start_sec
-            
-            # Calculate severity based on current suspicion_count (can increase or decrease)
-            if stats_ip.suspicion_count > 0:
-                severity = self._classify_severity(
-                    packet_count, unique_ports, stats_ip.suspicion_count
-                )
-
-            should_alert = False
-
-            if severity > 0:
-                # Escalate immediately if severity increased, otherwise respect cooldown
-                if severity > stats_ip.last_level:
-                    should_alert = True
-                elif stats_ip.last_alert is None or now - stats_ip.last_alert > self.alert_cooldown:
-                    should_alert = True
-
-            if should_alert:
-                self.detected_ips.add(src_ip)
-                stats_ip.last_alert = now
-                stats_ip.last_level = severity
-
-                # If severity is at maximum, add to firewall suggestions
-                if severity >= 4:
-                    if src_ip not in self.firewall_suggestions:
-                        self.firewall_suggestions[src_ip] = {
-                            "added": now,
-                            "is_subnet": False
-                        }
-                    
-                    if self.auto_block:
-                        blocked, was_new_rule, display_name = self._add_firewall_rule(src_ip, is_subnet=False)
-                        if blocked and was_new_rule and src_ip not in self.firewall_block_emails_sent:
-                            # Send email alert for firewall block (only for newly created rules)
-                            subject = f"🛡️ Firewall Block: {src_ip}"
-                            body = f"""Network Monitor Alert
-
-Action: IP Blocked in Windows Firewall
-IP Address: {src_ip}
-Firewall Rule Name: {display_name}
-Severity Level: L4
-Time: {now.isoformat()}
-
-The IP address has been automatically blocked due to reaching L4 severity level.
-"""
-                            self._send_email_alert(subject, body)
-                            self.firewall_block_emails_sent.add(src_ip)
-                
-                stats_ip.dst_ports.clear()
-
-            # Detect attack end when previously in attack, but severity has dropped below L3
-            # Severity decreases as suspicion_count decreases (decay mechanism)
-            if stats_ip.in_attack and severity < 3:
-                stats_ip.in_attack = False
-                first_ts = stats_ip.first_suspicious.isoformat() if stats_ip.first_suspicious else "unknown"
-                last_ts = stats_ip.last_suspicious.isoformat() if stats_ip.last_suspicious else "unknown"
-                duration_sec = 0.0
-                if stats_ip.first_suspicious and stats_ip.last_suspicious:
-                    duration_sec = (stats_ip.last_suspicious - stats_ip.first_suspicious).total_seconds()
-
-                self._log(
-                    f"ATTACK_END IP {src_ip} last_level=L{stats_ip.last_level} "
-                    f"first_suspicious={first_ts} last_suspicious={last_ts} "
-                    f"duration_sec={duration_sec:.2f}"
-                )
-
-        # Update per-subnet stats and check (to catch rotating IPs in same prefix)
         if subnet_key and stats_subnet is not None:
-            with stats_subnet.lock:
-                stats_subnet.packet_times.append(now)
-                if dst_port:
-                    stats_subnet.dst_ports.add(dst_port)
-
-                while stats_subnet.packet_times and now - stats_subnet.packet_times[0] > self.window:
-                    stats_subnet.packet_times.popleft()
-
-                subnet_packet_count = len(stats_subnet.packet_times)
-                subnet_unique_ports = len(stats_subnet.dst_ports)
-
-                base_suspicious_subnet = (
-                    subnet_packet_count >= self.max_packets
-                    or subnet_unique_ports >= self.max_ports
-                )
-
-                # Calculate current window start time (rounded down to 1-second boundary)
-                window_start_sec = int(now.timestamp())
-                
-                subnet_severity = 0
-                if base_suspicious_subnet:
-                    # Only increment suspicion_count once per window, not per packet
-                    if stats_subnet.last_suspicious_window_start != window_start_sec:
-                        stats_subnet.suspicion_count += 1
-                        stats_subnet.last_suspicious_window_start = window_start_sec
-                        if stats_subnet.first_suspicious is None:
-                            stats_subnet.first_suspicious = now
-                        stats_subnet.last_suspicious = now
-                else:
-                    # Decrement suspicion_count when not suspicious (decay mechanism)
-                    # Only decrement once per window, and only if suspicion_count > 0
-                    if stats_subnet.last_suspicious_window_start != window_start_sec and stats_subnet.suspicion_count > 0:
-                        stats_subnet.suspicion_count -= 1
-                        stats_subnet.last_suspicious_window_start = window_start_sec
-                
-                # Calculate severity based on current suspicion_count (can increase or decrease)
-                if stats_subnet.suspicion_count > 0:
-                    subnet_severity = self._classify_severity(
-                        subnet_packet_count, subnet_unique_ports, stats_subnet.suspicion_count
-                    )
-                subnet_alert = False
-
-                if subnet_severity > 0:
-                    if subnet_severity > stats_subnet.last_level:
-                        subnet_alert = True
-                    elif stats_subnet.last_alert is None or now - stats_subnet.last_alert > self.alert_cooldown:
-                        subnet_alert = True
-
-                if subnet_alert:
-                    self.detected_subnets.add(subnet_key)
-                    stats_subnet.last_alert = now
-                    stats_subnet.last_level = subnet_severity
-
-                    # For a /16, add to firewall suggestions
-                    if subnet_severity >= 4:
-                        if subnet_key not in self.firewall_suggestions:
-                            self.firewall_suggestions[subnet_key] = {
-                                "added": now,
-                                "is_subnet": True
-                            }
-                        
-                        if self.auto_block:
-                            blocked, was_new_rule, display_name = self._add_firewall_rule(subnet_key, is_subnet=True)
-                            if blocked and was_new_rule:
-                                if subnet_key not in self.firewall_block_emails_sent:
-                                    # Send email alert for subnet firewall block (only for newly created rules)
-                                    subject = f"🛡️ Firewall Block: {subnet_key}"
-                                    body = f"""Network Monitor Alert
-
-Action: Subnet Blocked in Windows Firewall
-Subnet: {subnet_key}
-Firewall Rule Name: {display_name}
-Severity Level: L4
-Time: {now.isoformat()}
-
-The subnet has been automatically blocked due to reaching L4 severity level.
-"""
-                                    self._send_email_alert(subject, body)
-                                    self.firewall_block_emails_sent.add(subnet_key)
-                                else:
-                                    if subnet_key not in self.email_skip_logged:
-                                        self._log(f"Email alert skipped for {subnet_key} (already sent)")
-                                        self.email_skip_logged.add(subnet_key)
-                            elif blocked and not was_new_rule:
-                                if subnet_key not in self.email_skip_logged:
-                                    self._log(f"Email alert skipped for {subnet_key} (rule already existed)")
-                                    self.email_skip_logged.add(subnet_key)
-
-                    stats_subnet.dst_ports.clear()
-
-                # Detect subnet attack end when previously in attack, but severity has dropped below L3
-                # Severity decreases as suspicion_count decreases (decay mechanism)
-                if stats_subnet.in_attack and subnet_severity < 3:
-                    stats_subnet.in_attack = False
-                    first_ts = stats_subnet.first_suspicious.isoformat() if stats_subnet.first_suspicious else "unknown"
-                    last_ts = stats_subnet.last_suspicious.isoformat() if stats_subnet.last_suspicious else "unknown"
-                    duration_sec = 0.0
-                    if stats_subnet.first_suspicious and stats_subnet.last_suspicious:
-                        duration_sec = (stats_subnet.last_suspicious - stats_subnet.first_suspicious).total_seconds()
-
-                    self._log(
-                        f"ATTACK_END SUBNET {subnet_key} last_level=L{stats_subnet.last_level} "
-                        f"first_suspicious={first_ts} last_suspicious={last_ts} "
-                        f"duration_sec={duration_sec:.2f}"
-                    )
+            subnet_severity, subnet_alert = self._process_entity_stats(
+                stats_subnet, subnet_key, now, dst_port,
+                self.detected_subnets, self.firewall_suggestions, is_subnet=True
+            )
+            
+            if subnet_alert and subnet_severity >= L4_SEVERITY_LEVEL:
+                self._handle_firewall_block(subnet_key, is_subnet=True, now=now)
     
-    def _get_current_suspicious(self):
+    def _get_current_suspicious(self) -> List[Dict[str, Any]]:
         """Get current suspicious IPs and subnets with their stats"""
         now = datetime.utcnow()
         suspicious = []
@@ -1347,14 +1251,14 @@ The subnet has been automatically blocked due to reaching L4 severity level.
         suspicious.sort(key=lambda x: (x['level'], x['packets']), reverse=True)
         return suspicious
     
-    def _periodic_save(self):
+    def _periodic_save(self) -> None:
         """Periodically save status to file"""
         while self.running:
             time.sleep(60)  # Save every 60 seconds
             if self.running:
                 self._save_status()
     
-    def _display_table(self):
+    def _display_table(self) -> None:
         """Display the dynamic table of suspicious IPs/subnets"""
         while self.running:
             time.sleep(1)  # Update every second
@@ -1418,7 +1322,7 @@ The subnet has been automatically blocked due to reaching L4 severity level.
                 
                 print("\nPress Ctrl+C to stop.")
     
-    def start(self, interface=None, interface_id=None):
+    def start(self, interface: Optional[str] = None, interface_id: Optional[str] = None) -> None:
         """Start monitoring on the specified interface"""
         if interface is None:
             interfaces = get_if_list()
@@ -1546,7 +1450,7 @@ def _load_env_file(env_path: str) -> None:
         pass
 
 
-def _collect_exclude_ips(args):
+def _collect_exclude_ips(args: argparse.Namespace) -> Optional[List[str]]:
     """Merge exclude IPs from CLI args and environment."""
     exclude_ips = None
     if args.exclude_ip:
@@ -1562,7 +1466,7 @@ def _collect_exclude_ips(args):
     return exclude_ips
 
 
-def _build_email_settings(args) -> dict:
+def _build_email_settings(args: argparse.Namespace) -> Dict[str, Any]:
     """Compose email configuration from args and environment."""
     smtp_server = args.email_smtp_server or os.getenv("EMAIL_SMTP_SERVER")
     smtp_port = args.email_smtp_port
@@ -1600,7 +1504,7 @@ def _build_email_settings(args) -> dict:
     }
 
 
-def create_web_app(monitor: NetworkMonitor, interface_id: str = None, firewall_prefix: str = "Block_Attacker_") -> "FastAPI":
+def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, firewall_prefix: str = FIREWALL_PREFIX) -> "FastAPI":
     """
     Build a FastAPI app around a NetworkMonitor instance.
     Only available when FastAPI/uvicorn are installed.
@@ -1768,7 +1672,7 @@ def create_web_app(monitor: NetworkMonitor, interface_id: str = None, firewall_p
                     entity_key = e.get("entity")
                     if not entity_key:
                         continue
-                    display_name = f"Block_Attacker_{entity_key.replace('/', '_').replace('.', '_')}"
+                    display_name = f"{FIREWALL_PREFIX}{entity_key.replace('/', '_').replace('.', '_')}"
                     prev_info = recent_entities.get(entity_key, {})
                     prev_packets = prev_info.get("packets_24h", 0)
                     packets_now = e.get("packets", 0) or 0

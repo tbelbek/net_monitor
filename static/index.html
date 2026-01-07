@@ -226,33 +226,58 @@
 
     function updateSpanLabels() {
       const label = currentSpanLabel();
+      const windowLabel = `(moving ${WINDOW_MINUTES} min window)`;
       const liveSpan = document.getElementById('span-live');
       const sevSpan = document.getElementById('span-severity');
       const talkSpan = document.getElementById('span-talkers');
       const portsSpan = document.getElementById('span-ports');
-      if (liveSpan) liveSpan.textContent = `(moving ${WINDOW_MINUTES} min window)`;
+      if (liveSpan) liveSpan.textContent = windowLabel;
       if (sevSpan) sevSpan.textContent = `(${label})`;
-      if (talkSpan) talkSpan.textContent = `(moving ${WINDOW_MINUTES} min window)`;
-      if (portsSpan) portsSpan.textContent = `(moving ${WINDOW_MINUTES} min window)`;
+      if (talkSpan) talkSpan.textContent = windowLabel;
+      if (portsSpan) portsSpan.textContent = windowLabel;
+    }
+
+    function updateDataTable(tableId, tableData, existingTable, options, setTable) {
+      if (existingTable) {
+        existingTable.clear();
+        existingTable.rows.add(tableData);
+        existingTable.draw();
+        return;
+      }
+      const tbody = document.querySelector(`#${tableId} tbody`);
+      tbody.innerHTML = '';
+      const htmlColumns = options.htmlColumns || [];
+      tableData.forEach(row => {
+        const tr = document.createElement('tr');
+        row.forEach((cell, idx) => {
+          const td = document.createElement('td');
+          td[htmlColumns.includes(idx) ? 'innerHTML' : 'textContent'] = cell;
+          tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+      });
+      const dtOptions = {};
+      for (const key in options) {
+        if (key !== 'htmlColumns') {
+          dtOptions[key] = options[key];
+        }
+      }
+      const table = $(`#${tableId}`).DataTable(dtOptions);
+      setTable(table);
+    }
+
+    function updateHistoryBuffer(history, data, key) {
+      const now = Date.now();
+      const cutoff = now - WINDOW_MINUTES * 60 * 1000;
+      history.push({ timestamp: now, data });
+      while (history.length > 0 && history[0].timestamp < cutoff) {
+        history.shift();
+      }
+      saveHistoryToStorage(key, history);
     }
 
     function renderTrafficTable(entries) {
-      const now = Date.now();
-      const cutoff = now - WINDOW_MINUTES * 60 * 1000;
-      
-      // Add current snapshot to history
-      trafficHistory.push({
-        timestamp: now,
-        data: entries
-      });
-      
-      // Remove old entries
-      while (trafficHistory.length > 0 && trafficHistory[0].timestamp < cutoff) {
-        trafficHistory.shift();
-      }
-      
-      // Save immediately after update
-      saveHistoryToStorage('traffic', trafficHistory);
+      updateHistoryBuffer(trafficHistory, entries, 'traffic');
       
       // Aggregate entries from the window (keep highest level and sum packets/ports)
       const entityMap = new Map();
@@ -303,32 +328,11 @@
         ];
       });
 
-      if (trafficTable) {
-        trafficTable.clear();
-        trafficTable.rows.add(tableData);
-        trafficTable.draw();
-      } else {
-        const tbody = document.querySelector('#traffic-table tbody');
-        tbody.innerHTML = '';
-        tableData.forEach(row => {
-          const tr = document.createElement('tr');
-          row.forEach((cell, idx) => {
-            const td = document.createElement('td');
-            if (idx === 0) {
-              td.innerHTML = cell;
-            } else {
-              td.textContent = cell;
-            }
-            tr.appendChild(td);
-          });
-          tbody.appendChild(tr);
-        });
-        trafficTable = $('#traffic-table').DataTable({
-          order: [[2, 'desc']],
-          pageLength: 10,
-          searching: true
-        });
-      }
+      updateDataTable('traffic-table', tableData, trafficTable, {
+        order: [[2, 'desc']],
+        pageLength: 10,
+        htmlColumns: [0]
+      }, (table) => { trafficTable = table; });
     }
 
     function filterHistory(history) {
@@ -447,22 +451,7 @@
     }
 
     function updateTalkersChart(talkers) {
-      const now = Date.now();
-      const cutoff = now - WINDOW_MINUTES * 60 * 1000;
-      
-      // Add current snapshot to history
-      talkersHistory.push({
-        timestamp: now,
-        data: talkers
-      });
-      
-      // Remove old entries
-      while (talkersHistory.length > 0 && talkersHistory[0].timestamp < cutoff) {
-        talkersHistory.shift();
-      }
-      
-      // Save immediately after update
-      saveHistoryToStorage('talkers', talkersHistory);
+      updateHistoryBuffer(talkersHistory, talkers, 'talkers');
       
       // Aggregate all entities from the window, preserving type
       const entityMap = new Map(); // entity -> {packets, type}
@@ -583,22 +572,7 @@
     }
 
     function updatePortsChart(ports) {
-      const now = Date.now();
-      const cutoff = now - WINDOW_MINUTES * 60 * 1000;
-      
-      // Add current snapshot to history
-      portsHistory.push({
-        timestamp: now,
-        data: ports
-      });
-      
-      // Remove old entries
-      while (portsHistory.length > 0 && portsHistory[0].timestamp < cutoff) {
-        portsHistory.shift();
-      }
-      
-      // Save immediately after update
-      saveHistoryToStorage('ports', portsHistory);
+      updateHistoryBuffer(portsHistory, ports, 'ports');
       
       // Aggregate all ports from the window
       const portMap = new Map();
@@ -745,35 +719,15 @@ AS: ${data.as || 'N/A'}
         recentEntitiesTable.draw();
         attachRecentEntityHandlers();
       } else {
-        const tbody = document.querySelector('#recent-entities-table tbody');
-        tbody.innerHTML = '';
-        tableData.forEach(row => {
-          const tr = document.createElement('tr');
-          row.forEach((cell, idx) => {
-            const td = document.createElement('td');
-            if (idx === 0 || idx === 6) {
-              td.innerHTML = cell;
-            } else {
-              td.textContent = cell;
-            }
-            tr.appendChild(td);
-          });
-          tbody.appendChild(tr);
-        });
-        recentEntitiesTable = $('#recent-entities-table').DataTable({
+        updateDataTable('recent-entities-table', tableData, recentEntitiesTable, {
           order: [[3, 'desc']],
           pageLength: 25,
-          searching: true,
           scrollY: '400px',
           scrollCollapse: true,
           dom: '<"top"lf<"clear">>rt<"bottom"ip<"clear">>',
-          columnDefs: [
-            { targets: [0, 6], orderable: false, render: function(data) { return data; } }
-          ],
-          drawCallback: function() {
-            // Re-attach event handlers after each draw
-            attachRecentEntityHandlers();
-          },
+          columnDefs: [{ targets: [0, 6], orderable: false, render: function(data) { return data; } }],
+          htmlColumns: [0, 6],
+          drawCallback: attachRecentEntityHandlers,
           initComplete: function() {
             let filterContainer = document.getElementById('recent-filters');
             if (!filterContainer) {
@@ -781,59 +735,25 @@ AS: ${data.as || 'N/A'}
               filterContainer.id = 'recent-filters';
               filterContainer.className = 'filter-container';
               filterContainer.innerHTML = `
-                <label>Type:
-                  <select id="filter-type">
-                    <option value="">All</option>
-                    <option value="IP">IP</option>
-                    <option value="Subnet">Subnet</option>
-                  </select>
-                </label>
-                <label>Severity:
-                  <select id="filter-severity">
-                    <option value="">All</option>
-                    <option value="L0">L0</option>
-                    <option value="L1">L1</option>
-                    <option value="L2">L2</option>
-                    <option value="L3">L3</option>
-                    <option value="L4">L4</option>
-                  </select>
-                </label>
-                <label>Firewall:
-                  <select id="filter-firewall">
-                    <option value="">All</option>
-                    <option value="Blocked">Blocked</option>
-                    <option value="NOT_BLOCKED">Not Blocked</option>
-                  </select>
-                </label>
+                <label>Type: <select id="filter-type"><option value="">All</option><option value="IP">IP</option><option value="Subnet">Subnet</option></select></label>
+                <label>Severity: <select id="filter-severity"><option value="">All</option><option value="L0">L0</option><option value="L1">L1</option><option value="L2">L2</option><option value="L3">L3</option><option value="L4">L4</option></select></label>
+                <label>Firewall: <select id="filter-firewall"><option value="">All</option><option value="Blocked">Blocked</option><option value="NOT_BLOCKED">Not Blocked</option></select></label>
               `;
-              const dtWrapper = document.querySelector('#recent-entities-table_wrapper');
-              const dtTop = dtWrapper.querySelector('.top');
-              if (dtTop) {
-                dtTop.appendChild(filterContainer);
-              }
+              document.querySelector('#recent-entities-table_wrapper .top')?.appendChild(filterContainer);
             }
-
             $('#filter-type').off('change').on('change', function() {
-              const val = $(this).val();
-              recentEntitiesTable.column(2).search(val ? '^' + val + '$' : '', true, false).draw();
+              recentEntitiesTable.column(2).search($(this).val() ? '^' + $(this).val() + '$' : '', true, false).draw();
             });
-
             $('#filter-severity').off('change').on('change', function() {
-              const val = $(this).val();
-              recentEntitiesTable.column(0).search(val ? val : '', true, false).draw();
+              recentEntitiesTable.column(0).search($(this).val() || '', true, false).draw();
             });
-
             $('#filter-firewall').off('change').on('change', function() {
               const val = $(this).val();
-              if (val === 'NOT_BLOCKED') {
-                recentEntitiesTable.column(5).search('^$', true, false).draw();
-              } else {
-                recentEntitiesTable.column(5).search(val ? '^' + val + '$' : '', true, false).draw();
-              }
+              recentEntitiesTable.column(5).search(val === 'NOT_BLOCKED' ? '^$' : (val ? '^' + val + '$' : ''), true, false).draw();
             });
             attachRecentEntityHandlers();
           }
-        });
+        }, (table) => { recentEntitiesTable = table; });
         attachRecentEntityHandlers();
       }
     }
@@ -875,32 +795,11 @@ AS: ${data.as || 'N/A'}
         `<button data-ip="${item.ip}" class="secondary remove-exclusion">Remove</button>`
       ]);
 
-      if (exclusionsTable) {
-        exclusionsTable.clear();
-        exclusionsTable.rows.add(tableData);
-        exclusionsTable.draw();
-      } else {
-        const tbody = document.querySelector('#exclusions-table tbody');
-        tbody.innerHTML = '';
-        tableData.forEach(row => {
-          const tr = document.createElement('tr');
-          row.forEach((cell, idx) => {
-            const td = document.createElement('td');
-            if (idx === 3) {
-              td.innerHTML = cell;
-            } else {
-              td.textContent = cell;
-            }
-            tr.appendChild(td);
-          });
-          tbody.appendChild(tr);
-        });
-        exclusionsTable = $('#exclusions-table').DataTable({
-          order: [[2, 'desc']],
-          pageLength: 10,
-          searching: true
-        });
-      }
+      updateDataTable('exclusions-table', tableData, exclusionsTable, {
+        order: [[2, 'desc']],
+        pageLength: 10,
+        htmlColumns: [3]
+      }, (table) => { exclusionsTable = table; });
 
       $(document).off('click', '.remove-exclusion').on('click', '.remove-exclusion', async function() {
         const ip = $(this).data('ip');
@@ -967,32 +866,11 @@ AS: ${data.as || 'N/A'}
         ];
       });
 
-      if (firewallTable) {
-        firewallTable.clear();
-        firewallTable.rows.add(tableData);
-        firewallTable.draw();
-      } else {
-        const tbody = document.querySelector('#firewall-table tbody');
-        tbody.innerHTML = '';
-        tableData.forEach(row => {
-          const tr = document.createElement('tr');
-          row.forEach((cell, idx) => {
-            const td = document.createElement('td');
-            if (idx === 5) {
-              td.innerHTML = cell;
-            } else {
-              td.textContent = cell;
-            }
-            tr.appendChild(td);
-          });
-          tbody.appendChild(tr);
-        });
-        firewallTable = $('#firewall-table').DataTable({
-          order: [[0, 'asc']],
-          pageLength: 10,
-          searching: true
-        });
-      }
+      updateDataTable('firewall-table', tableData, firewallTable, {
+        order: [[0, 'asc']],
+        pageLength: 10,
+        htmlColumns: [5]
+      }, (table) => { firewallTable = table; });
 
       $(document).off('click', '.remove-rule').on('click', '.remove-rule', async function() {
         const name = $(this).data('name');
