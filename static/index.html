@@ -1,0 +1,1025 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>net_monitor Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="https://cdn.datatables.net/1.13.7/css/jquery.dataTables.min.css">
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <script src="https://cdn.datatables.net/1.13.7/js/jquery.dataTables.min.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f5f6fa; color: #1f2d3d; }
+    header { background: #2c3e50; color: #ecf0f1; padding: 16px; }
+    nav { display: flex; gap: 12px; margin-top: 8px; }
+    nav button { padding: 8px 12px; border: none; background: #34495e; color: #ecf0f1; cursor: pointer; border-radius: 4px; }
+    nav button.active { background: #1abc9c; }
+    .container { padding: 16px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+    .grid-two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .last-seen-container { }
+    .card { background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 16px; margin-bottom: 16px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #e1e4e8; font-size: 14px; }
+    .pill { padding: 2px 8px; border-radius: 999px; color: #fff; font-size: 12px; }
+    .pill.l1 { background: #3498db; } .pill.l2 { background: #f39c12; }
+    .pill.l3 { background: #e67e22; } .pill.l4 { background: #c0392b; }
+    form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    input, textarea { padding: 8px; border: 1px solid #dcdfe6; border-radius: 4px; font-size: 14px; }
+    button.primary { background: #1abc9c; color: #fff; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+    button.secondary { background: #ecf0f1; color: #2c3e50; border: 1px solid #d0d7de; padding: 4px 10px; border-radius: 16px; cursor: pointer; font-size: 12px; }
+    button.secondary:hover, button.primary:hover { opacity: 0.9; }
+    .hidden { display: none; }
+    .filter-container { display: inline-flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-left: 16px; vertical-align: middle; }
+    .filter-container label { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #34495e; white-space: nowrap; }
+    .filter-container select { padding: 6px 10px; border: 1px solid #dcdfe6; border-radius: 4px; font-size: 13px; background: #fff; cursor: pointer; min-width: 80px; transition: border-color 0.2s; }
+    .filter-container select:hover { border-color: #1abc9c; }
+    .filter-container select:focus { outline: none; border-color: #1abc9c; box-shadow: 0 0 0 2px rgba(26, 188, 156, 0.1); }
+    #recent-entities-table_wrapper .top { display: flex; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    #recent-entities-table_wrapper .dataTables_filter { margin-bottom: 0; float: left; }
+    #recent-entities-table_wrapper .dataTables_filter input { margin-left: 8px; padding: 6px 10px; border: 1px solid #dcdfe6; border-radius: 4px; font-size: 13px; }
+    #recent-entities-table_wrapper .dataTables_length { float: left; margin-right: 20px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>net_monitor Dashboard</h1>
+  </header>
+
+  <div class="container">
+    <section id="dashboard" class="section">
+      <!-- Row 1: time series -->
+      <div class="card">
+        <h3>Severity Over Time <span id="span-severity" style="font-weight:normal;font-size:12px;color:#7f8c8d;"></span></h3>
+        <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <label>Range:
+            <select id="history-range">
+              <option value="1">Last 1 hour</option>
+              <option value="6">Last 6 hours</option>
+              <option value="24" selected>Last 24 hours</option>
+            </select>
+          </label>
+          <label><input type="checkbox" class="sev-filter" data-level="1" checked /> L1</label>
+          <label><input type="checkbox" class="sev-filter" data-level="2" checked /> L2</label>
+          <label><input type="checkbox" class="sev-filter" data-level="3" checked /> L3</label>
+          <label><input type="checkbox" class="sev-filter" data-level="4" checked /> L4</label>
+        </div>
+        <canvas id="severityChart" height="60"></canvas>
+      </div>
+
+      <!-- Row 2: other three charts -->
+      <div class="grid">
+        <div class="card">
+          <h3>Live Suspicious Traffic <span id="span-live" style="font-weight:normal;font-size:12px;color:#7f8c8d;"></span></h3>
+          <table id="traffic-table">
+            <thead>
+              <tr><th>Severity</th><th>Entity</th><th>Packets</th><th>Ports</th><th>Type</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h3>Top Talkers <span id="span-talkers" style="font-weight:normal;font-size:12px;color:#7f8c8d;"></span></h3>
+          <canvas id="talkersChart" height="120"></canvas>
+        </div>
+        <div class="card">
+          <h3>Ports Distribution <span id="span-ports" style="font-weight:normal;font-size:12px;color:#7f8c8d;"></span></h3>
+          <canvas id="portsChart" height="120"></canvas>
+        </div>
+      </div>
+
+      <!-- Row 3: last seen -->
+      <div class="card">
+        <h3>Last Seen IPs and Subnets (24h)</h3>
+        <div class="grid-two" style="margin-bottom:12px;">
+          <div>
+            <h4>Top IPs (24h)</h4>
+            <canvas id="lastIpChart" height="100"></canvas>
+          </div>
+          <div>
+            <h4>Top Subnets (24h)</h4>
+            <canvas id="lastSubnetChart" height="100"></canvas>
+          </div>
+        </div>
+        <div class="last-seen-container">
+          <table id="recent-entities-table">
+            <thead>
+              <tr><th>Severity</th><th>Entity</th><th>Type</th><th>Packets (24h)</th><th>Last Seen</th><th>Firewall</th><th>Actions</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Row 4: exclusions + firewall 50/50 -->
+      <div class="grid grid-two">
+        <div class="card">
+          <h3>Excluded IPs</h3>
+          <form id="exclusion-form" style="margin-bottom:12px;">
+            <input id="exclusion-ip" type="text" placeholder="IP address" required />
+            <input id="exclusion-note" type="text" placeholder="Note (optional)" />
+            <button type="submit" class="primary">Add</button>
+          </form>
+          <table id="exclusions-table">
+            <thead>
+              <tr><th>IP</th><th>Note</th><th>Created</th><th>Actions</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+            <h3 style="margin:0;">Firewall Rules</h3>
+            <button id="refresh-firewall" class="primary">Refresh Rules</button>
+          </div>
+          <p style="margin-top:0; margin-bottom:12px;">This section requires Windows. Fetch rules once the backend is running.</p>
+          <table id="firewall-table">
+            <thead>
+              <tr><th>Name</th><th>Direction</th><th>Action</th><th>Enabled</th><th>Remote Address</th><th>Actions</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <h4 style="margin-top:16px;">Add Firewall Rule</h4>
+          <form id="firewall-form">
+            <input id="fw-entity" type="text" placeholder="IP or subnet" required />
+            <label><input id="fw-subnet" type="checkbox" /> Is subnet</label>
+            <button type="submit" class="primary">Add Rule</button>
+          </form>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const severityCtx = document.getElementById('severityChart').getContext('2d');
+    const lastIpCtx = document.getElementById('lastIpChart').getContext('2d');
+    const lastSubnetCtx = document.getElementById('lastSubnetChart').getContext('2d');
+    const talkersCtx = document.getElementById('talkersChart').getContext('2d');
+    const portsCtx = document.getElementById('portsChart').getContext('2d');
+
+    let trafficTable = null;
+    let recentEntitiesTable = null;
+    let exclusionsTable = null;
+    let firewallTable = null;
+
+    const severityChart = new Chart(severityCtx, {
+      type: 'line',
+      data: { labels: [], datasets: [
+        { label: 'L1', data: [], borderColor: '#3498db', fill: false },
+        { label: 'L2', data: [], borderColor: '#f39c12', fill: false },
+        { label: 'L3', data: [], borderColor: '#e67e22', fill: false },
+        { label: 'L4', data: [], borderColor: '#c0392b', fill: false },
+      ]},
+      options: { responsive: true, animation: false, scales: { y: { beginAtZero: true } } }
+    });
+
+
+    const lastIpChart = new Chart(lastIpCtx, {
+      type: 'bar',
+      data: { labels: [], datasets: [{ label: 'Packets (24h)', data: [], backgroundColor: '#1abc9c' }] },
+      options: { responsive: true, animation: false, scales: { y: { beginAtZero: true } } }
+    });
+
+    const lastSubnetChart = new Chart(lastSubnetCtx, {
+      type: 'bar',
+      data: { labels: [], datasets: [{ label: 'Packets (24h)', data: [], backgroundColor: '#9b59b6' }] },
+      options: { responsive: true, animation: false, scales: { y: { beginAtZero: true } } }
+    });
+    const talkersChart = new Chart(talkersCtx, {
+      type: 'bar',
+      data: { labels: [], datasets: [] },
+      options: { 
+        responsive: true, 
+        animation: false, 
+        scales: { 
+          y: { beginAtZero: true, stacked: true },
+          x: { stacked: true }
+        },
+        plugins: {
+          legend: {
+            display: false
+          },
+          tooltip: {
+            callbacks: {
+              label: function(context) {
+                const label = context.dataset.label || '';
+                const value = context.parsed.y;
+                return label ? `${label}: ${value}` : `${value}`;
+              }
+            }
+          }
+        }
+      }
+    });
+
+    const portsChart = new Chart(portsCtx, {
+      type: 'bar',
+      data: { labels: [], datasets: [{ label: 'Occurrences', data: [], backgroundColor: '#9b59b6' }] },
+      options: { responsive: true, animation: false, scales: { y: { beginAtZero: true } } }
+    });
+
+    function currentSpanLabel() {
+      const hours = parseInt(document.getElementById('history-range').value, 10);
+      if (hours === 1) return 'last 1 hour';
+      return `last ${hours} hours`;
+    }
+
+    function updateSpanLabels() {
+      const label = currentSpanLabel();
+      const liveSpan = document.getElementById('span-live');
+      const sevSpan = document.getElementById('span-severity');
+      const talkSpan = document.getElementById('span-talkers');
+      const portsSpan = document.getElementById('span-ports');
+      if (liveSpan) liveSpan.textContent = `(moving ${WINDOW_MINUTES} min window)`;
+      if (sevSpan) sevSpan.textContent = `(${label})`;
+      if (talkSpan) talkSpan.textContent = `(moving ${WINDOW_MINUTES} min window)`;
+      if (portsSpan) portsSpan.textContent = `(moving ${WINDOW_MINUTES} min window)`;
+    }
+
+    function renderTrafficTable(entries) {
+      const now = Date.now();
+      const cutoff = now - WINDOW_MINUTES * 60 * 1000;
+      
+      // Add current snapshot to history
+      trafficHistory.push({
+        timestamp: now,
+        data: entries
+      });
+      
+      // Remove old entries
+      while (trafficHistory.length > 0 && trafficHistory[0].timestamp < cutoff) {
+        trafficHistory.shift();
+      }
+      
+      // Save immediately after update
+      saveHistoryToStorage('traffic', trafficHistory);
+      
+      // Aggregate entries from the window (keep highest level and sum packets/ports)
+      const entityMap = new Map();
+      trafficHistory.forEach(snapshot => {
+        snapshot.data.forEach(e => {
+          const key = `${e.entity}_${e.type}`;
+          const existing = entityMap.get(key);
+          if (!existing) {
+            entityMap.set(key, {
+              entity: e.entity,
+              type: e.type,
+              level: e.level || 0,
+              packets: e.packets || 0,
+              ports_set: new Set(e.ports_set || []),
+              last_seen: snapshot.timestamp
+            });
+          } else {
+            existing.packets += (e.packets || 0);
+            existing.level = Math.max(existing.level, e.level || 0);
+            if (e.ports_set) {
+              e.ports_set.forEach(p => existing.ports_set.add(p));
+            }
+            existing.last_seen = Math.max(existing.last_seen, snapshot.timestamp);
+          }
+        });
+      });
+      
+      // Convert to array and sort by packets descending
+      const aggregated = Array.from(entityMap.values())
+        .sort((a, b) => b.packets - a.packets)
+        .slice(0, 50); // Limit to top 50
+      
+      const tableData = aggregated.map(e => {
+        let portsText = '';
+        if (e.ports_set && e.ports_set.size > 0) {
+          portsText = Array.from(e.ports_set).sort((a, b) => a - b).join(', ');
+        }
+        if (portsText.length > 40) {
+          portsText = portsText.slice(0, 37) + '...';
+        }
+        const pillClass = `pill l${e.level || 0}`;
+        return [
+          `<span class="${pillClass}">L${e.level || 0}</span>`,
+          e.entity,
+          e.packets,
+          portsText,
+          e.type
+        ];
+      });
+
+      if (trafficTable) {
+        trafficTable.clear();
+        trafficTable.rows.add(tableData);
+        trafficTable.draw();
+      } else {
+        const tbody = document.querySelector('#traffic-table tbody');
+        tbody.innerHTML = '';
+        tableData.forEach(row => {
+          const tr = document.createElement('tr');
+          row.forEach((cell, idx) => {
+            const td = document.createElement('td');
+            if (idx === 0) {
+              td.innerHTML = cell;
+            } else {
+              td.textContent = cell;
+            }
+            tr.appendChild(td);
+          });
+          tbody.appendChild(tr);
+        });
+        trafficTable = $('#traffic-table').DataTable({
+          order: [[2, 'desc']],
+          pageLength: 10,
+          searching: true
+        });
+      }
+    }
+
+    function filterHistory(history) {
+      const hours = parseInt(document.getElementById('history-range').value, 10);
+      const cutoff = Date.now() - hours * 60 * 60 * 1000;
+      const enabledLevels = Array.from(document.querySelectorAll('.sev-filter'))
+        .filter(cb => cb.checked)
+        .map(cb => parseInt(cb.dataset.level, 10));
+      const filtered = history.filter(h => {
+        const t = new Date(h.ts).getTime();
+        return !Number.isNaN(t) && t >= cutoff;
+      });
+      return { filtered, enabledLevels };
+    }
+
+    function updateSeverityChart(history) {
+      const { filtered, enabledLevels } = filterHistory(history);
+      const labels = filtered.map(h => new Date(h.ts).toLocaleTimeString());
+      const levels = {1: [], 2: [], 3: [], 4: []};
+      filtered.forEach(h => {
+        [1,2,3,4].forEach(lvl => {
+          levels[lvl].push(enabledLevels.includes(lvl) ? (h.severity?.[lvl] || 0) : 0);
+        });
+      });
+      severityChart.data.labels = labels;
+      severityChart.data.datasets[0].data = levels[1];
+      severityChart.data.datasets[1].data = levels[2];
+      severityChart.data.datasets[2].data = levels[3];
+      severityChart.data.datasets[3].data = levels[4];
+      severityChart.update();
+    }
+
+    // Time-based history buffers for moving timeline
+    const WINDOW_MINUTES = 5; // Show data from last 5 minutes
+    const STORAGE_KEY_PREFIX = 'net_monitor_history_';
+    
+    // Load history from localStorage on page load
+    function loadHistoryFromStorage(key) {
+      try {
+        const stored = localStorage.getItem(STORAGE_KEY_PREFIX + key);
+        if (stored) {
+          const history = JSON.parse(stored);
+          if (Array.isArray(history)) {
+            const now = Date.now();
+            const cutoff = now - WINDOW_MINUTES * 60 * 1000;
+            // Filter out old entries and validate structure
+            return history.filter(item => 
+              item && 
+              typeof item === 'object' && 
+              typeof item.timestamp === 'number' && 
+              item.timestamp >= cutoff &&
+              item.data !== undefined
+            );
+          }
+        }
+      } catch (e) {
+        console.warn('Failed to load history from storage:', e);
+        // Clear corrupted data
+        try {
+          localStorage.removeItem(STORAGE_KEY_PREFIX + key);
+        } catch (e2) {
+          // Ignore
+        }
+      }
+      return [];
+    }
+    
+    // Save history to localStorage (keep only last 10 minutes to avoid storage bloat)
+    function saveHistoryToStorage(key, history) {
+      if (!Array.isArray(history)) {
+        return;
+      }
+      try {
+        const now = Date.now();
+        const maxAge = 10 * 60 * 1000; // 10 minutes
+        const cutoff = now - maxAge;
+        // Filter and validate entries
+        const filtered = history.filter(item => 
+          item && 
+          typeof item === 'object' && 
+          typeof item.timestamp === 'number' && 
+          item.timestamp >= cutoff &&
+          item.data !== undefined
+        );
+        localStorage.setItem(STORAGE_KEY_PREFIX + key, JSON.stringify(filtered));
+      } catch (e) {
+        console.warn('Failed to save history to storage:', e);
+        // If storage is full, try to clear old data
+        try {
+          const keys = Object.keys(localStorage);
+          keys.filter(k => k.startsWith(STORAGE_KEY_PREFIX)).forEach(k => localStorage.removeItem(k));
+        } catch (e2) {
+          // Ignore cleanup errors
+        }
+      }
+    }
+    
+    const talkersHistory = loadHistoryFromStorage('talkers');
+    const portsHistory = loadHistoryFromStorage('ports');
+    const trafficHistory = loadHistoryFromStorage('traffic');
+    
+    // Save history periodically (every 10 seconds)
+    setInterval(() => {
+      saveHistoryToStorage('talkers', talkersHistory);
+      saveHistoryToStorage('ports', portsHistory);
+      saveHistoryToStorage('traffic', trafficHistory);
+    }, 10000);
+
+    function ipToSubnet16(ip) {
+      // Convert IP to /16 subnet (e.g., 192.168.1.1 -> 192.168.0.0/16)
+      const parts = ip.split('.');
+      if (parts.length === 4) {
+        return `${parts[0]}.${parts[1]}.0.0/16`;
+      }
+      return null;
+    }
+
+    function updateTalkersChart(talkers) {
+      const now = Date.now();
+      const cutoff = now - WINDOW_MINUTES * 60 * 1000;
+      
+      // Add current snapshot to history
+      talkersHistory.push({
+        timestamp: now,
+        data: talkers
+      });
+      
+      // Remove old entries
+      while (talkersHistory.length > 0 && talkersHistory[0].timestamp < cutoff) {
+        talkersHistory.shift();
+      }
+      
+      // Save immediately after update
+      saveHistoryToStorage('talkers', talkersHistory);
+      
+      // Aggregate all entities from the window, preserving type
+      const entityMap = new Map(); // entity -> {packets, type}
+      talkersHistory.forEach(snapshot => {
+        snapshot.data.forEach(t => {
+          const entity = t.entity;
+          const packets = t.packets || 0;
+          const type = t.type || (entity.includes('/') ? 'SUBNET' : 'IP');
+          if (entityMap.has(entity)) {
+            entityMap.get(entity).packets += packets;
+          } else {
+            entityMap.set(entity, { packets, type });
+          }
+        });
+      });
+      
+      // Group IPs by subnet - only process IP type entities
+      const subnetMap = new Map(); // subnet -> Map(ip -> packets)
+      const subnetTotals = new Map(); // subnet -> total packets
+      const singleIPs = []; // IPs that are alone in their subnet (show directly)
+      
+      entityMap.forEach((info, entity) => {
+        const { packets, type } = info;
+        // Only process IP type entities, ignore SUBNET type
+        if (type === 'IP') {
+          const subnet = ipToSubnet16(entity);
+          if (subnet) {
+            if (!subnetMap.has(subnet)) {
+              subnetMap.set(subnet, new Map());
+              subnetTotals.set(subnet, 0);
+            }
+            subnetMap.get(subnet).set(entity, packets);
+            subnetTotals.set(subnet, subnetTotals.get(subnet) + packets);
+          } else {
+            // IP that couldn't be converted to subnet, show directly
+            singleIPs.push({ entity, packets });
+          }
+        }
+        // Ignore SUBNET type entities - they're not shown in this chart
+      });
+      
+      // Separate subnets with multiple IPs from single-IP subnets
+      const multiIPSSubnets = []; // subnets with 2+ IPs (will be stacked)
+      
+      subnetMap.forEach((ips, subnet) => {
+        if (ips.size > 1) {
+          // Multiple IPs in subnet - show subnet on axis, IPs stacked
+          multiIPSSubnets.push({ subnet, total: subnetTotals.get(subnet), ips });
+        } else {
+          // Only one IP in this subnet - show IP directly on axis
+          const ip = Array.from(ips.keys())[0];
+          const packets = ips.get(ip);
+          singleIPs.push({ entity: ip, packets });
+        }
+      });
+      
+      // Sort and get top entries
+      multiIPSSubnets.sort((a, b) => b.total - a.total);
+      singleIPs.sort((a, b) => b.packets - a.packets);
+      
+      // Combine labels: multi-IP subnets (subnet name), single IPs (IP name)
+      const allLabels = [
+        ...multiIPSSubnets.map(s => s.subnet),
+        ...singleIPs.map(e => e.entity)
+      ].slice(0, 10); // Top 10 total
+      
+      // Create datasets: one per IP (only for multi-IP subnets)
+      const datasets = [];
+      const colors = ['#1abc9c', '#3498db', '#9b59b6', '#e67e22', '#c0392b', '#f39c12', '#16a085', '#27ae60', '#2980b9', '#8e44ad', '#d35400', '#c0392b'];
+      
+      // Collect all IPs that are part of multi-IP subnets
+      const stackedIPs = new Set();
+      multiIPSSubnets.forEach(({ ips }) => {
+        ips.forEach((packets, ip) => {
+          stackedIPs.add(ip);
+        });
+      });
+      
+      // Create datasets for stacked IPs (only in multi-IP subnet columns)
+      Array.from(stackedIPs).forEach((ip, ipIdx) => {
+        const dataset = {
+          label: ip,
+          data: new Array(allLabels.length).fill(0),
+          backgroundColor: colors[ipIdx % colors.length]
+        };
+        
+        // Fill in packet counts for this IP in multi-IP subnet columns
+        allLabels.forEach((label, labelIdx) => {
+          const subnetInfo = multiIPSSubnets.find(s => s.subnet === label);
+          if (subnetInfo && subnetInfo.ips.has(ip)) {
+            dataset.data[labelIdx] = subnetInfo.ips.get(ip);
+          }
+        });
+        
+        // Only add dataset if it has non-zero values
+        if (dataset.data.some(v => v > 0)) {
+          datasets.push(dataset);
+        }
+      });
+      
+      // Add single IPs as separate datasets (one bar per IP, not stacked)
+      singleIPs.forEach((item, idx) => {
+        const dataset = {
+          label: item.entity,
+          data: new Array(allLabels.length).fill(0),
+          backgroundColor: colors[(stackedIPs.size + idx) % colors.length]
+        };
+        const labelIdx = allLabels.indexOf(item.entity);
+        if (labelIdx >= 0) {
+          dataset.data[labelIdx] = item.packets;
+        }
+        datasets.push(dataset);
+      });
+      
+      talkersChart.data.labels = allLabels;
+      talkersChart.data.datasets = datasets;
+      talkersChart.update();
+    }
+
+    function updatePortsChart(ports) {
+      const now = Date.now();
+      const cutoff = now - WINDOW_MINUTES * 60 * 1000;
+      
+      // Add current snapshot to history
+      portsHistory.push({
+        timestamp: now,
+        data: ports
+      });
+      
+      // Remove old entries
+      while (portsHistory.length > 0 && portsHistory[0].timestamp < cutoff) {
+        portsHistory.shift();
+      }
+      
+      // Save immediately after update
+      saveHistoryToStorage('ports', portsHistory);
+      
+      // Aggregate all ports from the window
+      const portMap = new Map();
+      portsHistory.forEach(snapshot => {
+        snapshot.data.forEach(p => {
+          const port = p.port;
+          const count = p.count || 0;
+          portMap.set(port, (portMap.get(port) || 0) + count);
+        });
+      });
+      
+      // Sort by total count and take top 10
+      const aggregated = Array.from(portMap.entries())
+        .map(([port, count]) => ({ port, count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 10);
+      
+      portsChart.data.labels = aggregated.map(p => p.port);
+      portsChart.data.datasets[0].data = aggregated.map(p => p.count);
+      portsChart.update();
+    }
+
+
+    function renderRecentEntities(list) {
+      const ips = [];
+      const subnets = [];
+
+      const tableData = list.map(item => {
+        const pillClass = `pill l${item.last_level || 0}`;
+        const typeText = item.type === 'SUBNET' ? 'Subnet' : 'IP';
+        const packets = item.packets_24h || 0;
+        const firewallText = item.has_rule ? 'Blocked' : '';
+        const lastSeen = item.last_seen ? new Date(item.last_seen).toLocaleString() : '';
+        const entityId = item.entity;
+
+        if (item.type === 'SUBNET') {
+          subnets.push({ entity: item.entity, packets });
+        } else {
+          ips.push({ entity: item.entity, packets });
+        }
+
+        const locationButton = item.type === 'IP' 
+          ? `<button class="secondary recent-location" data-entity="${entityId}">Location</button>`
+          : '';
+        return [
+          `<span class="${pillClass}">L${item.last_level || 0}</span>`,
+          item.entity,
+          typeText,
+          packets,
+          lastSeen,
+          firewallText,
+          `<button class="secondary recent-exclude" data-entity="${entityId}">Exclude</button> <button class="secondary recent-block" data-entity="${entityId}" data-type="${item.type}">Block</button> ${locationButton}`
+        ];
+      });
+
+      // Sort by packet count descending
+      ips.sort((a, b) => (b.packets || 0) - (a.packets || 0));
+      subnets.sort((a, b) => (b.packets || 0) - (a.packets || 0));
+
+      const topIps = ips.slice(0, 10);
+      const topSubnets = subnets.slice(0, 10);
+
+      lastIpChart.data.labels = topIps.map(x => x.entity);
+      lastIpChart.data.datasets[0].data = topIps.map(x => x.packets || 0);
+      lastIpChart.update();
+
+      lastSubnetChart.data.labels = topSubnets.map(x => x.entity);
+      lastSubnetChart.data.datasets[0].data = topSubnets.map(x => x.packets || 0);
+      lastSubnetChart.update();
+
+      function attachRecentEntityHandlers() {
+        $(document).off('click', '.recent-exclude').on('click', '.recent-exclude', async function() {
+          const ip = $(this).data('entity');
+          const res = await fetch('/api/exclusions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ip, note: 'Added from recent activity list' })
+          });
+          if (res.ok) {
+            loadExclusions();
+          }
+        });
+
+        $(document).off('click', '.recent-block').on('click', '.recent-block', async function() {
+          const entity = $(this).data('entity');
+          const type = $(this).data('type');
+          const is_subnet = type === 'SUBNET';
+          const res = await fetch('/api/firewall-rules', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ entity, is_subnet })
+          });
+          if (res.ok) {
+            loadFirewall();
+          }
+        });
+
+        $(document).off('click', '.recent-location').on('click', '.recent-location', async function() {
+          const ip = $(this).data('entity');
+          const btn = $(this);
+          const originalText = btn.text();
+          btn.text('Loading...').prop('disabled', true);
+          
+          try {
+            const res = await fetch(`http://ip-api.com/json/${ip}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,query`);
+            const data = await res.json();
+            
+            if (data.status === 'success') {
+              const locationInfo = `
+IP Address: ${data.query}
+Country: ${data.country} (${data.countryCode})
+Region: ${data.regionName}, ${data.city}${data.zip ? ' ' + data.zip : ''}
+Coordinates: ${data.lat}, ${data.lon}
+Timezone: ${data.timezone}
+ISP: ${data.isp}
+Organization: ${data.org || 'N/A'}
+AS: ${data.as || 'N/A'}
+              `.trim();
+              alert(locationInfo);
+            } else {
+              alert(`Failed to get location for ${ip}: ${data.message || 'Unknown error'}`);
+            }
+          } catch (error) {
+            alert(`Error fetching location for ${ip}: ${error.message}`);
+          } finally {
+            btn.text(originalText).prop('disabled', false);
+          }
+        });
+      }
+
+      if (recentEntitiesTable) {
+        const typeFilter = $('#filter-type').val();
+        const severityFilter = $('#filter-severity').val();
+        const firewallFilter = $('#filter-firewall').val();
+        recentEntitiesTable.clear();
+        recentEntitiesTable.rows.add(tableData);
+        recentEntitiesTable.column(2).search(typeFilter ? '^' + typeFilter + '$' : '', true, false);
+        recentEntitiesTable.column(0).search(severityFilter ? severityFilter : '', true, false);
+        if (firewallFilter === 'NOT_BLOCKED') {
+          recentEntitiesTable.column(5).search('^$', true, false);
+        } else {
+          recentEntitiesTable.column(5).search(firewallFilter ? '^' + firewallFilter + '$' : '', true, false);
+        }
+        recentEntitiesTable.draw();
+        attachRecentEntityHandlers();
+      } else {
+        const tbody = document.querySelector('#recent-entities-table tbody');
+        tbody.innerHTML = '';
+        tableData.forEach(row => {
+          const tr = document.createElement('tr');
+          row.forEach((cell, idx) => {
+            const td = document.createElement('td');
+            if (idx === 0 || idx === 6) {
+              td.innerHTML = cell;
+            } else {
+              td.textContent = cell;
+            }
+            tr.appendChild(td);
+          });
+          tbody.appendChild(tr);
+        });
+        recentEntitiesTable = $('#recent-entities-table').DataTable({
+          order: [[3, 'desc']],
+          pageLength: 25,
+          searching: true,
+          scrollY: '400px',
+          scrollCollapse: true,
+          dom: '<"top"lf<"clear">>rt<"bottom"ip<"clear">>',
+          columnDefs: [
+            { targets: [0, 6], orderable: false, render: function(data) { return data; } }
+          ],
+          drawCallback: function() {
+            // Re-attach event handlers after each draw
+            attachRecentEntityHandlers();
+          },
+          initComplete: function() {
+            let filterContainer = document.getElementById('recent-filters');
+            if (!filterContainer) {
+              filterContainer = document.createElement('div');
+              filterContainer.id = 'recent-filters';
+              filterContainer.className = 'filter-container';
+              filterContainer.innerHTML = `
+                <label>Type:
+                  <select id="filter-type">
+                    <option value="">All</option>
+                    <option value="IP">IP</option>
+                    <option value="Subnet">Subnet</option>
+                  </select>
+                </label>
+                <label>Severity:
+                  <select id="filter-severity">
+                    <option value="">All</option>
+                    <option value="L0">L0</option>
+                    <option value="L1">L1</option>
+                    <option value="L2">L2</option>
+                    <option value="L3">L3</option>
+                    <option value="L4">L4</option>
+                  </select>
+                </label>
+                <label>Firewall:
+                  <select id="filter-firewall">
+                    <option value="">All</option>
+                    <option value="Blocked">Blocked</option>
+                    <option value="NOT_BLOCKED">Not Blocked</option>
+                  </select>
+                </label>
+              `;
+              const dtWrapper = document.querySelector('#recent-entities-table_wrapper');
+              const dtTop = dtWrapper.querySelector('.top');
+              if (dtTop) {
+                dtTop.appendChild(filterContainer);
+              }
+            }
+
+            $('#filter-type').off('change').on('change', function() {
+              const val = $(this).val();
+              recentEntitiesTable.column(2).search(val ? '^' + val + '$' : '', true, false).draw();
+            });
+
+            $('#filter-severity').off('change').on('change', function() {
+              const val = $(this).val();
+              recentEntitiesTable.column(0).search(val ? val : '', true, false).draw();
+            });
+
+            $('#filter-firewall').off('change').on('change', function() {
+              const val = $(this).val();
+              if (val === 'NOT_BLOCKED') {
+                recentEntitiesTable.column(5).search('^$', true, false).draw();
+              } else {
+                recentEntitiesTable.column(5).search(val ? '^' + val + '$' : '', true, false).draw();
+              }
+            });
+            attachRecentEntityHandlers();
+          }
+        });
+        attachRecentEntityHandlers();
+      }
+    }
+
+    function connectWebSocket() {
+      const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/traffic`);
+      ws.onmessage = (ev) => {
+        const data = JSON.parse(ev.data);
+        updateSpanLabels();
+        renderTrafficTable(data.entries || []);
+        if (data.severity_history) {
+          updateSeverityChart(data.severity_history);
+        }
+        if (data.top_talkers) updateTalkersChart(data.top_talkers);
+        if (data.top_ports) updatePortsChart(data.top_ports);
+        if (data.recent_entities) renderRecentEntities(data.recent_entities);
+      };
+      ws.onclose = () => setTimeout(connectWebSocket, 2000);
+    }
+    connectWebSocket();
+
+    document.getElementById('history-range').addEventListener('change', () => {
+      updateSpanLabels();
+    });
+    document.querySelectorAll('.sev-filter').forEach(cb => {
+      cb.addEventListener('change', () => {
+        // Charts update on next tick when new data arrives.
+      });
+    });
+
+    async function loadExclusions() {
+      const res = await fetch('/api/exclusions');
+      if (!res.ok) return;
+      const data = await res.json();
+      const tableData = data.map(item => [
+        item.ip,
+        item.note || '',
+        item.created_at ? new Date(item.created_at).toLocaleString() : '',
+        `<button data-ip="${item.ip}" class="secondary remove-exclusion">Remove</button>`
+      ]);
+
+      if (exclusionsTable) {
+        exclusionsTable.clear();
+        exclusionsTable.rows.add(tableData);
+        exclusionsTable.draw();
+      } else {
+        const tbody = document.querySelector('#exclusions-table tbody');
+        tbody.innerHTML = '';
+        tableData.forEach(row => {
+          const tr = document.createElement('tr');
+          row.forEach((cell, idx) => {
+            const td = document.createElement('td');
+            if (idx === 3) {
+              td.innerHTML = cell;
+            } else {
+              td.textContent = cell;
+            }
+            tr.appendChild(td);
+          });
+          tbody.appendChild(tr);
+        });
+        exclusionsTable = $('#exclusions-table').DataTable({
+          order: [[2, 'desc']],
+          pageLength: 10,
+          searching: true
+        });
+      }
+
+      $(document).off('click', '.remove-exclusion').on('click', '.remove-exclusion', async function() {
+        const ip = $(this).data('ip');
+        const delRes = await fetch(`/api/exclusions/${encodeURIComponent(ip)}`, { method: 'DELETE' });
+        if (delRes.ok) loadExclusions();
+      });
+    }
+    loadExclusions();
+    loadFirewall();
+
+    document.getElementById('exclusion-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const ip = document.getElementById('exclusion-ip').value.trim();
+      const note = document.getElementById('exclusion-note').value.trim();
+      const res = await fetch('/api/exclusions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ip, note: note || null })
+      });
+      if (res.ok) {
+        document.getElementById('exclusion-form').reset();
+        loadExclusions();
+      }
+    });
+
+    async function loadFirewall() {
+      const res = await fetch('/api/firewall-rules');
+      if (!res.ok) return;
+      const data = await res.json();
+      const tableData = data.map(rule => {
+        // Backend now normalizes values: Direction (1=Inbound, 2=Outbound), Action (0=NotConfigured, 1=Allow, 2=Block), Enabled (boolean)
+        const enabledText = rule.Enabled === true || rule.Enabled === 1 ? 'Yes' : 'No';
+        
+        let directionRaw = '';
+        const dirVal = rule.Direction;
+        if (dirVal === 1) {
+          directionRaw = 'Inbound';
+        } else if (dirVal === 2) {
+          directionRaw = 'Outbound';
+        } else if (dirVal != null) {
+          directionRaw = String(dirVal);
+        }
+        
+        let actionRaw = '';
+        const actVal = rule.Action;
+        if (actVal === 0) {
+          actionRaw = 'Not configured';
+        } else if (actVal === 1) {
+          actionRaw = 'Allow';
+        } else if (actVal === 2) {
+          actionRaw = 'Block';
+        } else if (actVal != null) {
+          actionRaw = String(actVal);
+        }
+        
+        const displayName = rule.DisplayName || rule.display_name || '';
+        return [
+          displayName,
+          directionRaw,
+          actionRaw,
+          enabledText,
+          rule.RemoteAddress || '',
+          `<button data-name="${displayName}" class="secondary remove-rule">Remove</button>`
+        ];
+      });
+
+      if (firewallTable) {
+        firewallTable.clear();
+        firewallTable.rows.add(tableData);
+        firewallTable.draw();
+      } else {
+        const tbody = document.querySelector('#firewall-table tbody');
+        tbody.innerHTML = '';
+        tableData.forEach(row => {
+          const tr = document.createElement('tr');
+          row.forEach((cell, idx) => {
+            const td = document.createElement('td');
+            if (idx === 5) {
+              td.innerHTML = cell;
+            } else {
+              td.textContent = cell;
+            }
+            tr.appendChild(td);
+          });
+          tbody.appendChild(tr);
+        });
+        firewallTable = $('#firewall-table').DataTable({
+          order: [[0, 'asc']],
+          pageLength: 10,
+          searching: true
+        });
+      }
+
+      $(document).off('click', '.remove-rule').on('click', '.remove-rule', async function() {
+        const name = $(this).data('name');
+        const delRes = await fetch(`/api/firewall-rules/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        if (delRes.ok) loadFirewall();
+      });
+    }
+
+    document.getElementById('refresh-firewall').addEventListener('click', loadFirewall);
+
+    document.getElementById('firewall-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const entity = document.getElementById('fw-entity').value.trim();
+      const is_subnet = document.getElementById('fw-subnet').checked;
+      const res = await fetch('/api/firewall-rules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ entity, is_subnet })
+      });
+      if (res.ok) {
+        document.getElementById('firewall-form').reset();
+        loadFirewall();
+      }
+    });
+
+    setInterval(loadFirewall, 10 * 60 * 1000);
+  </script>
+</body>
+</html>
+

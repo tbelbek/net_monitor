@@ -4,6 +4,7 @@ Network Monitor - Real-time malicious IP detection using Npcap
 Monitors all network traffic and detects suspicious behavior patterns.
 """
 
+import asyncio
 import sys
 import platform
 import os
@@ -17,9 +18,11 @@ import ipaddress
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from collections import deque, defaultdict
+from collections import deque, defaultdict, Counter
 from datetime import datetime, timedelta
 from threading import Lock, Thread
+from typing import Optional
+
 from scapy.all import get_if_list, sniff, IP, TCP, UDP
 
 try:
@@ -27,6 +30,14 @@ try:
     DOTENV_AVAILABLE = True
 except ImportError:
     DOTENV_AVAILABLE = False
+
+try:
+    from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+    from fastapi.staticfiles import StaticFiles
+    import uvicorn
+    FASTAPI_AVAILABLE = True
+except ImportError:
+    FASTAPI_AVAILABLE = False
 
 
 class IpStats:
@@ -56,7 +67,8 @@ class NetworkMonitor:
         self.max_ports = max_ports
         self.alert_cooldown = timedelta(seconds=alert_cooldown)
         self.auto_block = auto_block  # Automatically add firewall rules for L4
-        self.exclude_ips = set()  # Will be loaded from file or set from parameter
+        self.exclude_ips = set()  # Will be loaded from DB or set from parameter
+        self.exclude_lock = Lock()
         
         # Email alert configuration
         self.email_smtp_server = email_smtp_server
@@ -89,9 +101,13 @@ class NetworkMonitor:
         self.excluded_ips_file = os.path.join(base_dir, "excluded_ips.json")
         self.last_log_date = None  # Track the date of the current log file
         
-        # Load excluded IPs from JSON file (if not provided via command line)
+        # Ensure DB schema before loading exclusions
+        self._ensure_status_db()
+        self._migrate_excluded_ips_json_to_db()
+
+        # Load excluded IPs from SQLite unless provided via command line
         if exclude_ips is None:
-            self._load_excluded_ips()
+            self.exclude_ips = self._load_excluded_ips_from_db()
         else:
             if isinstance(exclude_ips, str):
                 self.exclude_ips = {exclude_ips}
@@ -111,9 +127,10 @@ class NetworkMonitor:
         self._initialize_log_rotation()
         
         # Load previous status if available
-        self._ensure_status_db()
         self._migrate_status_json_to_db()
         self._load_status()
+
+    # --- Web API helpers are defined later; see create_web_app() at module level ---
 
     def _initialize_log_rotation(self) -> None:
         """Initialize log rotation by checking the current log file date."""
@@ -183,20 +200,18 @@ class NetworkMonitor:
             # Logging failures should not break monitoring
             pass
     
-    def _load_excluded_ips(self) -> None:
-        """Load excluded IPs from JSON file."""
+    def _load_excluded_ips_from_db(self) -> set:
+        """Load excluded IPs from SQLite table."""
         try:
-            if os.path.exists(self.excluded_ips_file):
-                with open(self.excluded_ips_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    self.exclude_ips = set(data.get("excluded_ips", []))
-                    if self.exclude_ips:
-                        self._log(f"Loaded {len(self.exclude_ips)} excluded IPs from {self.excluded_ips_file}: {', '.join(sorted(self.exclude_ips))}")
-            else:
-                self.exclude_ips = set()
+            with sqlite3.connect(self.status_db_path) as conn:
+                rows = conn.execute("SELECT ip FROM excluded_ips").fetchall()
+                ips = {row[0] for row in rows if row and row[0]}
+                if ips:
+                    self._log(f"Loaded {len(ips)} excluded IPs from SQLite")
+                return ips
         except Exception as e:
-            self._log(f"Error loading excluded IPs: {e}")
-            self.exclude_ips = set()
+            self._log(f"Error loading excluded IPs from SQLite: {e}")
+            return set()
     
     def _is_private_ip(self, ip: str) -> bool:
         """Check if an IP address is a private/local IP address."""
@@ -513,6 +528,15 @@ class NetworkMonitor:
                     )
                     """
                 )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS excluded_ips (
+                        ip TEXT PRIMARY KEY,
+                        note TEXT,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
                 conn.commit()
         except Exception as e:
             self._log(f"Error initializing status DB: {e}")
@@ -606,6 +630,96 @@ class NetworkMonitor:
         except Exception as e:
             self._log(f"Error migrating status JSON to DB: {e}")
     
+    def _migrate_excluded_ips_json_to_db(self) -> None:
+        """One-time migration of excluded_ips.json into SQLite excluded_ips table."""
+        try:
+            if not os.path.exists(self.excluded_ips_file):
+                return
+
+            with sqlite3.connect(self.status_db_path) as conn:
+                row = conn.execute("SELECT COUNT(*) FROM excluded_ips").fetchone()
+                if row and row[0]:
+                    return
+
+                with open(self.excluded_ips_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                ips = data.get("excluded_ips", []) if isinstance(data, dict) else []
+
+                now_val = datetime.utcnow().isoformat()
+                for ip in ips:
+                    if not ip:
+                        continue
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO excluded_ips (ip, note, created_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (ip, None, now_val),
+                    )
+                conn.commit()
+
+            self._log(
+                f"Migrated {len(ips)} excluded IPs from JSON to SQLite at {self.status_db_path}"
+            )
+        except Exception as e:
+            self._log(f"Error migrating excluded IPs JSON to DB: {e}")
+
+    def list_excluded_ips(self):
+        """Return all excluded IPs with metadata."""
+        try:
+            with sqlite3.connect(self.status_db_path) as conn:
+                rows = conn.execute(
+                    "SELECT ip, note, created_at FROM excluded_ips ORDER BY created_at"
+                ).fetchall()
+                return [
+                    {"ip": row[0], "note": row[1], "created_at": row[2]} for row in rows
+                ]
+        except Exception as e:
+            self._log(f"Error listing excluded IPs: {e}")
+            return []
+
+    def add_excluded_ip(self, ip: str, note: str = None) -> bool:
+        """Add or update an excluded IP in SQLite and in-memory set."""
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+
+        try:
+            with self.exclude_lock:
+                with sqlite3.connect(self.status_db_path) as conn:
+                    existing = conn.execute(
+                        "SELECT note, created_at FROM excluded_ips WHERE ip = ?", (ip,)
+                    ).fetchone()
+                    created_at = existing[1] if existing and existing[1] else datetime.utcnow().isoformat()
+                    note_to_use = note if note is not None else (existing[0] if existing else None)
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO excluded_ips (ip, note, created_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (ip, note_to_use, created_at),
+                    )
+                    conn.commit()
+                self.exclude_ips.add(ip)
+            return True
+        except Exception as e:
+            self._log(f"Error adding excluded IP {ip}: {e}")
+            return False
+
+    def remove_excluded_ip(self, ip: str) -> bool:
+        """Remove an excluded IP from SQLite and in-memory set."""
+        try:
+            with self.exclude_lock:
+                with sqlite3.connect(self.status_db_path) as conn:
+                    conn.execute("DELETE FROM excluded_ips WHERE ip = ?", (ip,))
+                    conn.commit()
+                self.exclude_ips.discard(ip)
+            return True
+        except Exception as e:
+            self._log(f"Error removing excluded IP {ip}: {e}")
+            return False
+
     def _send_email_alert(self, subject: str, body: str) -> None:
         """Send an email alert."""
         if not self.email_enabled:
@@ -729,6 +843,111 @@ class NetworkMonitor:
         except Exception as e:
             self._log(f"FIREWALL_EXCEPTION {entity} error={str(e)}")
             return (False, False, display_name)
+    
+    def list_firewall_rules(self, prefix: str = "Block_Attacker_"):
+        """List Windows Firewall rules matching the provided display name prefix."""
+        if not platform.system().lower().startswith("win"):
+            return []
+        
+        try:
+            cmd = [
+                "powershell",
+                "-Command",
+                (
+                    f"Get-NetFirewallRule -DisplayName '{prefix}*' | ForEach-Object {{ "
+                    f"$rule=$_; "
+                    f"$addr = Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $rule; "
+                    f"[PSCustomObject]@{{ "
+                    f"DisplayName=$rule.DisplayName; "
+                    f"Direction=$rule.Direction; "
+                    f"Action=$rule.Action; "
+                    f"Enabled=$rule.Enabled; "
+                    f"RemoteAddress=($addr.RemoteAddress -join ',') "
+                    f"}} "
+                    f"}} | ConvertTo-Json"
+                ),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode != 0:
+                self._log(f"FIREWALL_LIST_ERROR stderr={result.stderr}")
+                return []
+
+            output = result.stdout.strip()
+            if not output:
+                return []
+
+            parsed = json.loads(output)
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            if not isinstance(parsed, list):
+                return []
+            
+            # Normalize enum values for consistent frontend handling
+            normalized = []
+            for rule in parsed:
+                norm_rule = dict(rule)
+                # Normalize Direction: 1=Inbound, 2=Outbound
+                if 'Direction' in norm_rule:
+                    dir_val = norm_rule['Direction']
+                    if isinstance(dir_val, str):
+                        dir_lower = dir_val.lower()
+                        if dir_lower == 'inbound':
+                            norm_rule['Direction'] = 1
+                        elif dir_lower == 'outbound':
+                            norm_rule['Direction'] = 2
+                    elif isinstance(dir_val, (int, float)):
+                        norm_rule['Direction'] = int(dir_val)
+                # Normalize Action: 0=NotConfigured, 1=Allow, 2=Block
+                if 'Action' in norm_rule:
+                    act_val = norm_rule['Action']
+                    if isinstance(act_val, str):
+                        act_lower = act_val.lower()
+                        if act_lower in ('notconfigured', 'not configured'):
+                            norm_rule['Action'] = 0
+                        elif act_lower == 'allow':
+                            norm_rule['Action'] = 1
+                        elif act_lower == 'block':
+                            norm_rule['Action'] = 2
+                    elif isinstance(act_val, (int, float)):
+                        norm_rule['Action'] = int(act_val)
+                # Normalize Enabled: ensure boolean
+                if 'Enabled' in norm_rule:
+                    en_val = norm_rule['Enabled']
+                    if isinstance(en_val, str):
+                        norm_rule['Enabled'] = en_val.lower() in ('true', '1', 'yes')
+                    elif isinstance(en_val, (int, float)):
+                        norm_rule['Enabled'] = bool(en_val)
+                normalized.append(norm_rule)
+            return normalized
+        except subprocess.TimeoutExpired:
+            self._log("FIREWALL_LIST_TIMEOUT")
+            return []
+        except Exception as e:
+            self._log(f"FIREWALL_LIST_EXCEPTION error={e}")
+            return []
+
+    def remove_firewall_rule(self, display_name: str) -> bool:
+        """Remove a Windows Firewall rule by display name."""
+        if not platform.system().lower().startswith("win"):
+            return False
+        try:
+            cmd = [
+                "powershell",
+                "-Command",
+                f"Remove-NetFirewallRule -DisplayName '{display_name}' -ErrorAction Stop",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                self._log(f"FIREWALL_REMOVED display_name={display_name}")
+                return True
+            self._log(f"FIREWALL_REMOVE_ERROR display_name={display_name} stderr={result.stderr}")
+            return False
+        except subprocess.TimeoutExpired:
+            self._log(f"FIREWALL_REMOVE_TIMEOUT display_name={display_name}")
+            return False
+        except Exception as e:
+            self._log(f"FIREWALL_REMOVE_EXCEPTION display_name={display_name} error={e}")
+            return False
     
     def _test_firewall_privileges(self) -> bool:
         """
@@ -1381,6 +1600,229 @@ def _build_email_settings(args) -> dict:
     }
 
 
+def create_web_app(monitor: NetworkMonitor, interface_id: str = None, firewall_prefix: str = "Block_Attacker_") -> "FastAPI":
+    """
+    Build a FastAPI app around a NetworkMonitor instance.
+    Only available when FastAPI/uvicorn are installed.
+    """
+    if not FASTAPI_AVAILABLE:
+        raise RuntimeError("FastAPI/uvicorn are not installed. Install fastapi and uvicorn to use --web-ui mode.")
+
+    app = FastAPI(title="net_monitor web UI", version="1.0.0")
+    monitor_thread: Optional[Thread] = None
+    # Store up to 24h of per-minute severity history (24 * 60 buckets)
+    traffic_history = deque(maxlen=24 * 60)
+    last_history_bucket: Optional[str] = None
+    # Track last-seen entities for up to 24 hours (IP and SUBNET),
+    # including approximate packet totals over that period.
+    recent_entities = {}
+
+    def _require_windows():
+        if not platform.system().lower().startswith("win"):
+            raise HTTPException(status_code=400, detail="Firewall management is supported on Windows only")
+
+    @app.on_event("startup")
+    def _startup():
+        nonlocal monitor_thread
+        if monitor.running:
+            return
+        monitor_thread = Thread(target=monitor.start, kwargs={"interface_id": interface_id}, daemon=True)
+        monitor_thread.start()
+
+    @app.on_event("shutdown")
+    def _shutdown():
+        monitor.running = False
+        try:
+            monitor._save_status()
+        except Exception:
+            pass
+
+    @app.get("/api/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.get("/api/exclusions")
+    def list_exclusions():
+        return monitor.list_excluded_ips()
+
+    @app.post("/api/exclusions", status_code=201)
+    def add_exclusion(payload: dict):
+        ip = payload.get("ip") or ""
+        note = payload.get("note")
+        added = monitor.add_excluded_ip(ip, note)
+        if not added:
+            raise HTTPException(status_code=400, detail="Invalid IP or failed to save exclusion")
+        return {"ip": ip, "note": note}
+
+    @app.delete("/api/exclusions/{ip}")
+    def delete_exclusion(ip: str):
+        removed = monitor.remove_excluded_ip(ip)
+        if not removed:
+            raise HTTPException(status_code=404, detail="IP not found")
+        return {"removed": ip}
+
+    @app.get("/api/firewall-rules")
+    def get_firewall_rules():
+        _require_windows()
+        return monitor.list_firewall_rules(prefix=firewall_prefix)
+
+    @app.post("/api/firewall-rules", status_code=201)
+    def add_firewall_rule(payload: dict):
+        _require_windows()
+        entity = payload.get("entity") or ""
+        is_subnet = bool(payload.get("is_subnet", False))
+        success, was_new, display_name = monitor._add_firewall_rule(entity, is_subnet=is_subnet)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to add firewall rule")
+        return {"display_name": display_name, "created": was_new}
+
+    @app.delete("/api/firewall-rules/{display_name}")
+    def delete_firewall_rule(display_name: str):
+        _require_windows()
+        removed = monitor.remove_firewall_rule(display_name)
+        if not removed:
+            raise HTTPException(status_code=404, detail="Firewall rule not found or could not be removed")
+        return {"removed": display_name}
+
+    @app.websocket("/ws/traffic")
+    async def traffic_socket(websocket: WebSocket):
+        await websocket.accept()
+        try:
+            while True:
+                raw_entries = monitor._get_current_suspicious()
+                entries = []
+                port_counter: Counter[int] = Counter()
+                for item in raw_entries:
+                    entry = dict(item)
+                    ports_set = entry.get("ports_set") or []
+                    if isinstance(ports_set, set):
+                        ports_set = sorted(list(ports_set))
+                    entry["ports_set"] = ports_set
+                    entries.append(entry)
+                    for port in ports_set:
+                        port_counter[port] += 1
+
+                # Snapshot of current firewall rule names (to mark blocked entities)
+                rule_names = set()
+                try:
+                    rules = monitor.list_firewall_rules(prefix=firewall_prefix)
+                    for r in rules:
+                        name = r.get("DisplayName") or r.get("display_name")
+                        if name:
+                            rule_names.add(name)
+                except Exception:
+                    rule_names = set()
+
+                now_dt = datetime.utcnow()
+                now = now_dt.isoformat()
+                severity_counts = Counter(entry.get("level", 0) for entry in entries)
+                ip_count = sum(1 for e in entries if e.get("type") == "IP")
+                subnet_count = sum(1 for e in entries if e.get("type") == "SUBNET")
+
+                # Compact per-entity snapshot for history (used by per-IP charts)
+                per_entity = {}
+                for e in entries:
+                    entity = e.get("entity")
+                    if not entity:
+                        continue
+                    if e.get("type") != "IP":
+                        continue
+                    per_entity[entity] = per_entity.get(entity, 0) + (e.get("packets", 0) or 0)
+                entries_summary = [
+                    {"entity": k, "packets": v} for k, v in per_entity.items()
+                ]
+                top_talkers = sorted(entries, key=lambda e: e.get("packets", 0), reverse=True)[:5]
+                top_ports = [
+                    {"port": port, "count": count} for port, count in port_counter.most_common(5)
+                ]
+
+                # Per-minute aggregation for history (with IP/subnet counts and per-IP packets)
+                nonlocal last_history_bucket
+                bucket = now_dt.replace(second=0, microsecond=0).isoformat()
+                if bucket != last_history_bucket:
+                    traffic_history.append(
+                        {
+                            "ts": bucket,
+                            "severity": dict(severity_counts),
+                            "ip_count": ip_count,
+                            "subnet_count": subnet_count,
+                            "entries": entries_summary,
+                        }
+                    )
+                    last_history_bucket = bucket
+
+                # Maintain last-seen entities for the last 24 hours
+                cutoff = now_dt - timedelta(hours=24)
+                to_delete = []
+                for key, info in recent_entities.items():
+                    try:
+                        ts = datetime.fromisoformat(info.get("last_seen", ""))
+                    except Exception:
+                        ts = None
+                    if not ts or ts < cutoff:
+                        to_delete.append(key)
+                for key in to_delete:
+                    recent_entities.pop(key, None)
+
+                for e in entries:
+                    entity_key = e.get("entity")
+                    if not entity_key:
+                        continue
+                    display_name = f"Block_Attacker_{entity_key.replace('/', '_').replace('.', '_')}"
+                    prev_info = recent_entities.get(entity_key, {})
+                    prev_packets = prev_info.get("packets_24h", 0)
+                    packets_now = e.get("packets", 0) or 0
+                    recent_entities[entity_key] = {
+                        "entity": entity_key,
+                        "type": e.get("type", ""),
+                        "last_seen": now,
+                        "last_level": e.get("level", 0),
+                        "packets_24h": prev_packets + packets_now,
+                        "has_rule": display_name in rule_names,
+                    }
+
+                recent_list = sorted(
+                    recent_entities.values(),
+                    key=lambda x: (x.get("last_level", 0), x.get("last_seen", "")),
+                    reverse=True,
+                )[:200]
+
+                await websocket.send_json(
+                    {
+                        "timestamp": now,
+                        "window_seconds": monitor.window.total_seconds(),
+                        "max_packets": monitor.max_packets,
+                        "max_ports": monitor.max_ports,
+                        "entries": entries,
+                        "severity_counts": dict(severity_counts),
+                        "severity_history": list(traffic_history),
+                        "top_talkers": [
+                            {
+                                "entity": t["entity"],
+                                "packets": t.get("packets", 0),
+                                "ports": t.get("ports", 0),
+                                "level": t.get("level", 0),
+                                "type": t.get("type", ""),
+                            }
+                            for t in top_talkers
+                        ],
+                        "top_ports": top_ports,
+                        "recent_entities": recent_list,
+                    }
+                )
+                await asyncio.sleep(1)
+        except WebSocketDisconnect:
+            return
+        except Exception:
+            await asyncio.sleep(1)
+
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    if os.path.isdir(static_dir):
+        app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+
+    return app
+
+
 def main():
     """Main entry point"""
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -1472,6 +1914,17 @@ def main():
         action="store_true",
         help="Disable TLS/SSL for SMTP (not recommended)"
     )
+    parser.add_argument(
+        "--web-ui",
+        action="store_true",
+        help="Run FastAPI-based web UI instead of console display (suitable for Windows service).",
+    )
+    parser.add_argument(
+        "--web-port",
+        type=int,
+        default=8080,
+        help="HTTP port for web UI (when --web-ui is enabled, default: 8080).",
+    )
     args = parser.parse_args()
 
     exclude_ips = _collect_exclude_ips(args)
@@ -1492,7 +1945,15 @@ def main():
         email_to=email_settings["recipients"],
         email_use_tls=email_settings["use_tls"],
     )
-    monitor.start(interface_id=args.interface)
+
+    if args.web_ui:
+        if not FASTAPI_AVAILABLE:
+            print("FastAPI/uvicorn are not installed. Install fastapi and uvicorn to use --web-ui mode.")
+            sys.exit(1)
+        app = create_web_app(monitor, interface_id=args.interface)
+        uvicorn.run(app, host="0.0.0.0", port=args.web_port, log_level="info")
+    else:
+        monitor.start(interface_id=args.interface)
 
 
 if __name__ == "__main__":
