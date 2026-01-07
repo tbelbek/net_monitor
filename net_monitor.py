@@ -36,6 +36,9 @@ L4_THRESHOLD = BASE_SUSPICION_COUNT ** 4  # BASE^9
 FIREWALL_PREFIX = "Block_Attacker_"
 SUBNET_MASK = 16
 
+# SQL table name whitelist for security
+ALLOWED_SQL_TABLES = {"ip_stats", "subnet_stats", "detected_ips", "detected_subnets", "metadata", "firewall_suggestions", "excluded_ips", "ip_analysis_cache"}
+
 # Common port names mapping
 COMMON_PORTS = {
     20: "FTP-DATA", 21: "FTP", 22: "SSH", 23: "TELNET", 25: "SMTP", 53: "DNS",
@@ -226,22 +229,30 @@ class NetworkMonitor:
             
             # Update the last log date
             self.last_log_date = current_date
-        except Exception:
+        except (OSError, IOError, ValueError) as e:
             # Log rotation failures should not break monitoring
+            # Silently fail to avoid breaking the monitoring loop
             pass
     
-    def _log(self, message: str) -> None:
+    def _log(self, message: str, level: str = "INFO") -> None:
         """Append a log line with UTC timestamp to the log file."""
         # Rotate log if needed (check daily)
         self._rotate_log_if_needed()
         
+        # Sanitize sensitive data
+        sanitized_message = self._sanitize_log_message(message)
+        
         timestamp = datetime.utcnow().isoformat()
         try:
             with open(self.log_path, "a", encoding="utf-8") as f:
-                f.write(f"{timestamp} {message}\n")
-        except Exception:
+                f.write(f"{timestamp} [{level}] {sanitized_message}\n")
+        except (OSError, IOError) as e:
             # Logging failures should not break monitoring
-            pass
+            # Only log if we can (avoid infinite recursion)
+            try:
+                print(f"Logging error: {e}", file=sys.stderr)
+            except Exception:
+                pass
     
     def _load_excluded_ips_from_db(self) -> Set[str]:
         """Load excluded IPs from SQLite table."""
@@ -253,7 +264,7 @@ class NetworkMonitor:
                     self._log(f"Loaded {len(ips)} excluded IPs from SQLite")
                 return ips
         except (sqlite3.Error, OSError) as e:
-            self._log(f"Error loading excluded IPs from SQLite: {e}")
+            self._log(f"Error loading excluded IPs from SQLite: {e}", "ERROR")
             return set()
     
     def _is_private_ip(self, ip: str) -> bool:
@@ -275,6 +286,112 @@ class NetworkMonitor:
             return True
         except ValueError:
             return False
+    
+    def _sanitize_log_message(self, message: str) -> str:
+        """Sanitize sensitive data in log messages."""
+        import re
+        sanitized = message
+        
+        # Mask email addresses (show first 3 chars + domain)
+        email_pattern = r'\b([a-zA-Z0-9._%+-]{3})([a-zA-Z0-9._%+-]*?)@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b'
+        sanitized = re.sub(email_pattern, r'\1***@\3', sanitized)
+        
+        # Optionally mask IP addresses (show first 3 octets)
+        ip_pattern = r'\b(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}\b'
+        sanitized = re.sub(ip_pattern, r'\1.xxx', sanitized)
+        
+        # Remove any potential password/API key patterns
+        if 'password' in sanitized.lower() or 'api_key' in sanitized.lower() or 'api-key' in sanitized.lower():
+            sanitized = re.sub(r'(password|api[_-]?key)\s*[:=]\s*[^\s]+', r'\1=***', sanitized, flags=re.IGNORECASE)
+        
+        return sanitized
+    
+    def _validate_sql_table_name(self, table_name: str) -> bool:
+        """Validate that a table name is in the whitelist."""
+        return table_name in ALLOWED_SQL_TABLES
+    
+    def _escape_powershell_argument(self, arg: str) -> str:
+        """Escape a PowerShell argument to prevent command injection."""
+        if not arg:
+            return "''"
+        # Replace single quotes with two single quotes (PowerShell escaping)
+        escaped = arg.replace("'", "''")
+        # Wrap in single quotes
+        return f"'{escaped}'"
+    
+    def _validate_display_name(self, display_name: str) -> bool:
+        """Validate display name contains only safe characters."""
+        import re
+        # Only allow alphanumeric, underscore, hyphen, dot, slash
+        return bool(re.match(r'^[a-zA-Z0-9_\-./]+$', display_name))
+    
+    def _build_powershell_check_rule_cmd(self, display_name: str) -> List[str]:
+        """Build a safe PowerShell command to check if a firewall rule exists."""
+        if not self._validate_display_name(display_name):
+            raise ValueError(f"Invalid display name: {display_name}")
+        escaped_name = self._escape_powershell_argument(display_name)
+        return [
+            "powershell", "-Command",
+            f"Get-NetFirewallRule -DisplayName {escaped_name} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DisplayName"
+        ]
+    
+    def _build_powershell_create_rule_cmd(self, display_name: str, remote_address: str) -> List[str]:
+        """Build a safe PowerShell command to create a firewall rule."""
+        if not self._validate_display_name(display_name):
+            raise ValueError(f"Invalid display name: {display_name}")
+        # Validate remote_address is a valid IP or IP range
+        try:
+            if '-' in remote_address:
+                # IP range format: x.x.x.x-y.y.y.y
+                parts = remote_address.split('-')
+                if len(parts) == 2:
+                    ipaddress.ip_address(parts[0].strip())
+                    ipaddress.ip_address(parts[1].strip())
+            elif '/' in remote_address:
+                # CIDR format
+                ipaddress.ip_network(remote_address, strict=False)
+            else:
+                # Single IP
+                ipaddress.ip_address(remote_address)
+        except (ValueError, AttributeError):
+            raise ValueError(f"Invalid remote address: {remote_address}")
+        
+        escaped_name = self._escape_powershell_argument(display_name)
+        escaped_addr = self._escape_powershell_argument(remote_address)
+        return [
+            "powershell", "-Command",
+            f"New-NetFirewallRule -DisplayName {escaped_name} -Direction Inbound -Action Block -RemoteAddress {escaped_addr} -Protocol Any -ErrorAction Stop"
+        ]
+    
+    def _build_powershell_list_rules_cmd(self, prefix: str) -> List[str]:
+        """Build a safe PowerShell command to list firewall rules."""
+        if not self._validate_display_name(prefix):
+            raise ValueError(f"Invalid prefix: {prefix}")
+        escaped_prefix = self._escape_powershell_argument(prefix + "*")
+        return [
+            "powershell", "-Command",
+            f"Get-NetFirewallRule -DisplayName {escaped_prefix} | ForEach-Object {{ "
+            f"$rule=$_; "
+            f"$addr = Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $rule; "
+            f"[PSCustomObject]@{{ "
+            f"DisplayName=$rule.DisplayName; "
+            f"Direction=$rule.Direction; "
+            f"Action=$rule.Action; "
+            f"Enabled=$rule.Enabled; "
+            f"RemoteAddress=($addr.RemoteAddress -join ',') "
+            f"}} "
+            f"}} | ConvertTo-Json"
+        ]
+    
+    def _build_powershell_remove_rule_cmd(self, display_name: str) -> List[str]:
+        """Build a safe PowerShell command to remove a firewall rule."""
+        if not self._validate_display_name(display_name):
+            raise ValueError(f"Invalid display name: {display_name}")
+        escaped_name = self._escape_powershell_argument(display_name)
+        return [
+            "powershell", "-Command",
+            f"Remove-NetFirewallRule -DisplayName {escaped_name} -ErrorAction Stop"
+        ]
     
     def _get_all_server_ips(self) -> Set[str]:
         """Get all IP addresses (both private and public) from all network interfaces."""
@@ -395,6 +512,8 @@ class NetworkMonitor:
         self, conn: sqlite3.Connection, stats_dict: Dict[str, IpStats], table_name: str
     ) -> None:
         """Save stats dictionary to database table."""
+        if not self._validate_sql_table_name(table_name):
+            raise ValueError(f"Invalid table name: {table_name}")
         conn.execute(f"DELETE FROM {table_name}")
         for entity, stats in stats_dict.items():
             with stats.lock:
@@ -416,6 +535,8 @@ class NetworkMonitor:
 
     def _save_detected_entities(self, conn: sqlite3.Connection, entities: Set[str], table_name: str) -> None:
         """Save detected entities to database table."""
+        if not self._validate_sql_table_name(table_name):
+            raise ValueError(f"Invalid table name: {table_name}")
         conn.execute(f"DELETE FROM {table_name}")
         for entity in entities:
             conn.execute(f"INSERT INTO {table_name} (entity) VALUES (?)", (entity,))
@@ -452,12 +573,14 @@ class NetworkMonitor:
                     )
                 conn.commit()
         except (sqlite3.Error, OSError) as e:
-            self._log(f"Error saving status: {e}")
+            self._log(f"Error saving status: {e}", "ERROR")
 
     def _load_stats_from_db(
         self, conn: sqlite3.Connection, stats_dict: Dict[str, IpStats], table_name: str
     ) -> None:
         """Load stats from database table into stats dictionary."""
+        if not self._validate_sql_table_name(table_name):
+            raise ValueError(f"Invalid table name: {table_name}")
         for entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack in conn.execute(
             f"SELECT entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack FROM {table_name}"
         ):
@@ -788,9 +911,9 @@ class NetworkMonitor:
             server.send_message(msg)
             server.quit()
             
-            self._log(f"Email alert sent: {subject}")
-        except Exception as e:
-            self._log(f"Failed to send email alert: {str(e)}")
+            self._log(f"Email alert sent: {subject}", "INFO")
+        except (smtplib.SMTPException, OSError, IOError) as e:
+            self._log(f"Failed to send email alert: {str(e)}", "ERROR")
     
     def _check_firewall_rule_exists(self, display_name: str) -> bool:
         """
@@ -801,13 +924,11 @@ class NetworkMonitor:
             return False
         
         try:
-            check_cmd = [
-                "powershell", "-Command",
-                f"Get-NetFirewallRule -DisplayName '{display_name}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DisplayName"
-            ]
+            check_cmd = self._build_powershell_check_rule_cmd(display_name)
             result = subprocess.run(check_cmd, capture_output=True, text=True, timeout=5)
             return result.returncode == 0 and result.stdout.strip() != ""
-        except Exception:
+        except (ValueError, subprocess.TimeoutExpired, subprocess.SubprocessError) as e:
+            self._log(f"Error checking firewall rule existence: {e}", "WARNING")
             return False
     
     def _add_firewall_rule(self, entity: str, is_subnet: bool = False) -> Tuple[bool, bool, str]:
@@ -855,12 +976,7 @@ class NetworkMonitor:
                 return (True, False, display_name)
             
             # Create the firewall rule
-            cmd = [
-                "powershell", "-Command",
-                f"New-NetFirewallRule -DisplayName '{display_name}' "
-                f"-Direction Inbound -Action Block -RemoteAddress '{remote_address}' "
-                f"-Protocol Any -ErrorAction Stop"
-            ]
+            cmd = self._build_powershell_create_rule_cmd(display_name, remote_address)
             
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             
@@ -873,10 +989,10 @@ class NetworkMonitor:
                 return (False, False, display_name)
                 
         except subprocess.TimeoutExpired:
-            self._log(f"FIREWALL_TIMEOUT {entity}")
+            self._log(f"FIREWALL_TIMEOUT {entity}", "WARNING")
             return (False, False, display_name)
-        except Exception as e:
-            self._log(f"FIREWALL_EXCEPTION {entity} error={str(e)}")
+        except (ValueError, subprocess.SubprocessError) as e:
+            self._log(f"FIREWALL_EXCEPTION {entity} error={str(e)}", "ERROR")
             return (False, False, display_name)
     
     def list_firewall_rules(self, prefix: str = FIREWALL_PREFIX) -> List[Dict[str, Any]]:
@@ -885,23 +1001,7 @@ class NetworkMonitor:
             return []
         
         try:
-            cmd = [
-                "powershell",
-                "-Command",
-                (
-                    f"Get-NetFirewallRule -DisplayName '{prefix}*' | ForEach-Object {{ "
-                    f"$rule=$_; "
-                    f"$addr = Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $rule; "
-                    f"[PSCustomObject]@{{ "
-                    f"DisplayName=$rule.DisplayName; "
-                    f"Direction=$rule.Direction; "
-                    f"Action=$rule.Action; "
-                    f"Enabled=$rule.Enabled; "
-                    f"RemoteAddress=($addr.RemoteAddress -join ',') "
-                    f"}} "
-                    f"}} | ConvertTo-Json"
-                ),
-            ]
+            cmd = self._build_powershell_list_rules_cmd(prefix)
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             if result.returncode != 0:
                 self._log(f"FIREWALL_LIST_ERROR stderr={result.stderr}")
@@ -955,10 +1055,10 @@ class NetworkMonitor:
                 normalized.append(norm_rule)
             return normalized
         except subprocess.TimeoutExpired:
-            self._log("FIREWALL_LIST_TIMEOUT")
+            self._log("FIREWALL_LIST_TIMEOUT", "WARNING")
             return []
-        except Exception as e:
-            self._log(f"FIREWALL_LIST_EXCEPTION error={e}")
+        except (ValueError, subprocess.SubprocessError, json.JSONDecodeError) as e:
+            self._log(f"FIREWALL_LIST_EXCEPTION error={e}", "ERROR")
             return []
 
     def remove_firewall_rule(self, display_name: str) -> bool:
@@ -966,11 +1066,7 @@ class NetworkMonitor:
         if not platform.system().lower().startswith("win"):
             return False
         try:
-            cmd = [
-                "powershell",
-                "-Command",
-                f"Remove-NetFirewallRule -DisplayName '{display_name}' -ErrorAction Stop",
-            ]
+            cmd = self._build_powershell_remove_rule_cmd(display_name)
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
                 self._log(f"FIREWALL_REMOVED display_name={display_name}")
@@ -978,10 +1074,10 @@ class NetworkMonitor:
             self._log(f"FIREWALL_REMOVE_ERROR display_name={display_name} stderr={result.stderr}")
             return False
         except subprocess.TimeoutExpired:
-            self._log(f"FIREWALL_REMOVE_TIMEOUT display_name={display_name}")
+            self._log(f"FIREWALL_REMOVE_TIMEOUT display_name={display_name}", "WARNING")
             return False
-        except Exception as e:
-            self._log(f"FIREWALL_REMOVE_EXCEPTION display_name={display_name} error={e}")
+        except (ValueError, subprocess.SubprocessError) as e:
+            self._log(f"FIREWALL_REMOVE_EXCEPTION display_name={display_name} error={e}", "ERROR")
             return False
     
     def _test_firewall_privileges(self) -> bool:
@@ -998,29 +1094,18 @@ class NetworkMonitor:
         
         try:
             # Try to create a test firewall rule
-            create_cmd = [
-                "powershell", "-Command",
-                f"New-NetFirewallRule -DisplayName '{display_name}' "
-                f"-Direction Inbound -Action Block -RemoteAddress '{test_ip}' "
-                f"-Protocol Any -ErrorAction Stop"
-            ]
+            create_cmd = self._build_powershell_create_rule_cmd(display_name, test_ip)
             
             result = subprocess.run(create_cmd, capture_output=True, text=True, timeout=10)
             
             if result.returncode == 0:
                 # Rule created successfully, now verify it exists
-                check_cmd = [
-                    "powershell", "-Command",
-                    f"Get-NetFirewallRule -DisplayName '{display_name}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DisplayName"
-                ]
+                check_cmd = self._build_powershell_check_rule_cmd(display_name)
                 check_result = subprocess.run(check_cmd, capture_output=True, text=True, timeout=5)
                 
                 if check_result.returncode == 0 and check_result.stdout.strip():
                     # Rule exists, now remove it
-                    remove_cmd = [
-                        "powershell", "-Command",
-                        f"Remove-NetFirewallRule -DisplayName '{display_name}' -ErrorAction Stop"
-                    ]
+                    remove_cmd = self._build_powershell_remove_rule_cmd(display_name)
                     remove_result = subprocess.run(remove_cmd, capture_output=True, text=True, timeout=10)
                     
                     if remove_result.returncode == 0:
@@ -1042,10 +1127,10 @@ class NetworkMonitor:
                 return False
                 
         except subprocess.TimeoutExpired:
-            self._log(f"FIREWALL_PRIV_CHECK FAILED (timeout)")
+            self._log(f"FIREWALL_PRIV_CHECK FAILED (timeout)", "WARNING")
             return False
-        except Exception as e:
-            self._log(f"FIREWALL_PRIV_CHECK FAILED (exception: {str(e)})")
+        except (ValueError, subprocess.SubprocessError) as e:
+            self._log(f"FIREWALL_PRIV_CHECK FAILED (exception: {str(e)})", "ERROR")
             return False
     
     def _classify_severity(self, packet_count: int, unique_ports: int, suspicion_count: int) -> int:
@@ -1516,11 +1601,8 @@ The {entity_type.lower()} has been automatically blocked due to reaching L4 seve
             suspicious = self._get_current_suspicious()
             
             with self.display_lock:
-                # Clear screen (Windows)
-                if platform.system().lower().startswith("win"):
-                    os.system('cls')
-                else:
-                    os.system('clear')
+                # Clear screen using ANSI escape codes (cross-platform)
+                print('\033[2J\033[H', end='')
                 
                 # Print header
                 print("=" * 110)
