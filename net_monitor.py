@@ -2000,6 +2000,9 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
         # Start background task for auto IPinfo analysis
         if HTTPX_AVAILABLE:
             asyncio.create_task(process_auto_ipinfo_analysis())
+            monitor._log("IPinfo auto-analysis background task started")
+        else:
+            monitor._log("IPinfo auto-analysis disabled (httpx not available)", "WARNING")
 
     @app.on_event("shutdown")
     def _shutdown():

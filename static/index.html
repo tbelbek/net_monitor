@@ -980,6 +980,13 @@ AS: ${data.as || 'N/A'}
       }
     });
 
+    // Auto-refresh packet samples table every minute
+    setInterval(() => {
+      if (packetSamplesTable) {
+        packetSamplesTable.ajax.reload(null, false);
+      }
+    }, 60000);
+
     function formatPacketSample(s) {
       const timestamp = s.timestamp ? new Date(s.timestamp).toLocaleString() : 'N/A';
       const entity = s.entity || 'N/A';
