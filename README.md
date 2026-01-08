@@ -174,10 +174,10 @@ An IP or subnet is flagged as suspicious if it exceeds either threshold within t
 Severity is classified based on the number of suspicious windows detected (suspicion_count), using exponential escalation with a configurable base value:
 
 - **Level 0**: Below thresholds (no alert)
-- **Level 1 (L1)**: BASE^1 suspicious windows (default: 16)
-- **Level 2 (L2)**: BASE^3 suspicious windows (default: 16³ = 4,096)
-- **Level 3 (L3)**: BASE^6 suspicious windows (default: 16⁶ = 16,777,216)
-- **Level 4 (L4)**: BASE^9 suspicious windows (default: 16⁹ = 68,719,476,736)
+- **Level 1 (L1)**: BASE^1 suspicious windows (default: 8)
+- **Level 2 (L2)**: BASE^2 suspicious windows (default: 8² = 64)
+- **Level 3 (L3)**: BASE^3 suspicious windows (default: 8³ = 512)
+- **Level 4 (L4)**: BASE^4 suspicious windows (default: 8⁴ = 4,096)
 
 The base value (`BASE_SUSPICION_COUNT`) is defined in `net_monitor.py` and can be modified to adjust all thresholds. Threshold values are logged at startup for verification.
 
@@ -216,7 +216,7 @@ UTC-timestamped log file containing:
 
 Example log entries:
 ```
-2026-01-05T11:00:00.000000 Severity thresholds: L1=16, L2=4096, L3=16777216, L4=68719476736 (BASE=16)
+2026-01-05T11:00:00.000000 Severity thresholds: L1=8, L2=64, L3=512, L4=4096 (BASE=8)
 2026-01-05T11:03:31.916087 ATTACK_START IP 98.128.167.1 level=L4 first_suspicious=2026-01-05T11:03:31.916087
 2026-01-05T11:26:58.006932 ATTACK_END IP 98.128.167.1 last_level=L4 duration_sec=1406.09
 2026-01-05T11:21:08.516048 FIREWALL_BLOCKED 200.115.0.0/16 remote_address=200.115.0.0-200.115.255.255 display_name=Block_Attacker_200_115_0_0_16
@@ -264,7 +264,7 @@ Firewall rules are named: `Block_Attacker_{entity}` (with dots and slashes repla
 
 **Protection Mechanisms:**
 - The tool queries Windows Firewall directly to check if a rule already exists before creating a new one (prevents duplicates)
-- **Excluded IPs are never blocked**: IPs in `excluded_ips.json`, specified via `--exclude-ip`, or automatically excluded (local/WAN IPs) are skipped from firewall rule creation
+- **Excluded IPs are never blocked**: IPs in the SQLite database, specified via `--exclude-ip`, or automatically excluded (local/WAN IPs) are skipped from firewall rule creation
 - **Subnet protection**: Subnets containing excluded IPs are also prevented from being blocked
 - **Email alerts for firewall blocks**: Email notifications are sent only when a new firewall rule is created (not for existing rules)
 
@@ -318,7 +318,7 @@ Press `Ctrl+C` to gracefully stop the monitor. The tool will:
 The tool includes a web-based dashboard for monitoring and management:
 
 ```bash
-python net_monitor.py --web-ui --port 8080
+python net_monitor.py --web-ui --web-port 8080
 ```
 
 The web UI provides:
@@ -548,17 +548,17 @@ python net_monitor.py \
 
 **Severity Threshold Customization:**
 
-The severity thresholds use exponential growth based on `BASE_SUSPICION_COUNT` (default: 16). To change the base value, edit the constant in `net_monitor.py`:
+The severity thresholds use exponential growth based on `BASE_SUSPICION_COUNT` (default: 8). To change the base value, edit the constant in `net_monitor.py`:
 
 ```python
-BASE_SUSPICION_COUNT = 16  # Change this value
+BASE_SUSPICION_COUNT = 8  # Change this value
 ```
 
 All thresholds will be automatically recalculated:
 - L1 = BASE^1
-- L2 = BASE^3
-- L3 = BASE^6
-- L4 = BASE^9
+- L2 = BASE^2
+- L3 = BASE^3
+- L4 = BASE^4
 
 Threshold values are logged at startup for verification.
 
