@@ -36,6 +36,19 @@ L4_THRESHOLD = BASE_SUSPICION_COUNT ** 4  # BASE^9
 FIREWALL_PREFIX = "Block_Attacker_"
 SUBNET_MASK = 16
 
+# Timing constants
+SAVE_INTERVAL_SECONDS = 60
+DISPLAY_UPDATE_INTERVAL_SECONDS = 1
+DISPLAY_SHUTDOWN_WAIT_SECONDS = 1.5
+SSE_UPDATE_INTERVAL_SECONDS = 1
+SSE_KEEPALIVE_INTERVAL_SECONDS = 15
+FIREWALL_CACHE_REFRESH_INTERVAL_SECONDS = 30
+AUTO_ANALYZE_INITIAL_DELAY_SECONDS = 2
+AUTO_ANALYZE_CHECK_INTERVAL_SECONDS = 2
+AUTO_ANALYZE_ERROR_WAIT_SECONDS = 5
+PACKET_SAMPLE_CLEANUP_DAYS = 7
+IP_ANALYSIS_CACHE_EXPIRY_DAYS = 7
+
 # SQL table name whitelist for security
 ALLOWED_SQL_TABLES = {"ip_stats", "subnet_stats", "detected_ips", "detected_subnets", "metadata", "firewall_suggestions", "excluded_ips", "ip_analysis_cache"}
 
@@ -73,6 +86,11 @@ try:
     HTTPX_AVAILABLE = True
 except ImportError:
     HTTPX_AVAILABLE = False
+
+
+def is_windows() -> bool:
+    """Check if running on Windows platform."""
+    return platform.system().lower().startswith("win")
 
 
 class IpStats:
@@ -201,7 +219,7 @@ class NetworkMonitor:
                     self.last_log_date = file_mtime.date()
             else:
                 self.last_log_date = datetime.utcnow().date()
-        except Exception:
+        except (OSError, ValueError, AttributeError):
             self.last_log_date = datetime.utcnow().date()
     
     def _rotate_log_if_needed(self) -> None:
@@ -252,7 +270,7 @@ class NetworkMonitor:
             # Only log if we can (avoid infinite recursion)
             try:
                 print(f"Logging error: {e}", file=sys.stderr)
-            except Exception:
+            except (OSError, IOError):
                 pass
     
     def _load_excluded_ips_from_db(self) -> Set[str]:
@@ -400,7 +418,7 @@ class NetworkMonitor:
 
         # Get all IPs from network interfaces
         try:
-            if platform.system().lower().startswith("win"):
+            if is_windows():
                 from scapy.arch.windows import get_windows_if_list
                 win_if_info = get_windows_if_list()
                 for w in win_if_info:
@@ -415,9 +433,9 @@ class NetworkMonitor:
                     local_ip = s.getsockname()[0]
                     s.close()
                     server_ips.add(local_ip)
-                except Exception:
+                except (socket.error, OSError, AttributeError):
                     pass
-        except Exception:
+        except (OSError, AttributeError, ImportError):
             pass
 
         # Also check all network interfaces using socket
@@ -452,7 +470,7 @@ class NetworkMonitor:
         
         for service in services:
             try:
-                if platform.system().lower().startswith("win"):
+                if is_windows():
                     cmd = [
                         "powershell", "-Command",
                         f"try {{ (Invoke-WebRequest -Uri '{service}' -UseBasicParsing -TimeoutSec 5).Content.Trim() }} catch {{ '' }}"
@@ -952,7 +970,7 @@ class NetworkMonitor:
         Check if a firewall rule with the given display name exists in Windows Firewall.
         Returns True if the rule exists, False otherwise.
         """
-        if not platform.system().lower().startswith("win"):
+        if not is_windows():
             return False
         
         try:
@@ -987,7 +1005,7 @@ class NetworkMonitor:
                             self.logged_skip_entities.add(entity)
                         return (True, False, display_name)
         
-        if not platform.system().lower().startswith("win"):
+        if not is_windows():
             if entity not in self.logged_skip_entities:
                 self._log(f"FIREWALL_SKIP {entity} (not Windows)")
                 self.logged_skip_entities.add(entity)
@@ -1029,7 +1047,7 @@ class NetworkMonitor:
     
     def list_firewall_rules(self, prefix: str = FIREWALL_PREFIX) -> List[Dict[str, Any]]:
         """List Windows Firewall rules matching the provided display name prefix."""
-        if not platform.system().lower().startswith("win"):
+        if not is_windows():
             return []
         
         try:
@@ -1095,7 +1113,7 @@ class NetworkMonitor:
 
     def remove_firewall_rule(self, display_name: str) -> bool:
         """Remove a Windows Firewall rule by display name."""
-        if not platform.system().lower().startswith("win"):
+        if not is_windows():
             return False
         try:
             cmd = self._build_powershell_remove_rule_cmd(display_name)
@@ -1118,7 +1136,7 @@ class NetworkMonitor:
         Creates a test rule, verifies it exists, then removes it.
         Returns True if privileges are sufficient, False otherwise.
         """
-        if not platform.system().lower().startswith("win"):
+        if not is_windows():
             return False
         
         test_ip = "192.0.2.1"  # Test-Net IP (RFC 5737) - safe to use for testing
@@ -1255,7 +1273,7 @@ class NetworkMonitor:
                             # Check if it looks like text
                             if all(32 <= b <= 126 or b in (9, 10, 13) for b in payload_bytes):
                                 analysis["payload_preview"] = payload_bytes.decode('utf-8', errors='ignore')[:100]
-                        except Exception:
+                        except (UnicodeDecodeError, ValueError, AttributeError):
                             pass
                 else:
                     analysis["has_payload"] = False
@@ -1335,7 +1353,7 @@ class NetworkMonitor:
                                 with self.auto_analyze_lock:
                                     if entity not in [item['ip'] for item in self.auto_analyze_queue]:
                                         self.auto_analyze_queue.append({'ip': entity, 'timestamp': now})
-                except Exception:
+                except (ValueError, AttributeError, KeyError):
                     pass  # Skip invalid IPs silently
                 
         except Exception as e:
@@ -1346,9 +1364,9 @@ class NetworkMonitor:
         return self.packet_samples.get(entity, [])
     
     def _cleanup_old_packet_samples(self) -> None:
-        """Remove packet samples older than 7 days."""
+        """Remove packet samples older than configured days."""
         try:
-            cutoff = datetime.utcnow() - timedelta(days=7)
+            cutoff = datetime.utcnow() - timedelta(days=PACKET_SAMPLE_CLEANUP_DAYS)
             entities_to_remove = []
             
             for entity, samples in self.packet_samples.items():
@@ -1620,7 +1638,7 @@ The {entity_type.lower()} has been automatically blocked due to reaching L4 seve
     def _periodic_save(self) -> None:
         """Periodically save status to file"""
         while self.running:
-            time.sleep(60)  # Save every 60 seconds
+            time.sleep(SAVE_INTERVAL_SECONDS)
             if self.running:
                 self._save_status()
                 self._cleanup_old_packet_samples()  # Cleanup old samples every minute
@@ -1628,7 +1646,7 @@ The {entity_type.lower()} has been automatically blocked due to reaching L4 seve
     def _display_table(self) -> None:
         """Display the dynamic table of suspicious IPs/subnets"""
         while self.running:
-            time.sleep(1)  # Update every second
+            time.sleep(DISPLAY_UPDATE_INTERVAL_SECONDS)
             
             suspicious = self._get_current_suspicious()
             
@@ -1697,11 +1715,11 @@ The {entity_type.lower()} has been automatically blocked due to reaching L4 seve
 
             # On Windows, try to show friendly names and IPs using get_windows_if_list
             win_if_info = []
-            if platform.system().lower().startswith("win"):
+            if is_windows():
                 try:
                     from scapy.arch.windows import get_windows_if_list  # type: ignore
                     win_if_info = get_windows_if_list()
-                except Exception:
+                except (ImportError, AttributeError, OSError):
                     win_if_info = []
 
             print("Available interfaces:")
@@ -1781,7 +1799,7 @@ The {entity_type.lower()} has been automatically blocked due to reaching L4 seve
             sniff(iface=interface, prn=self.process_packet, store=False)
         except KeyboardInterrupt:
             self.running = False
-            time.sleep(1.5)  # Let display thread finish current update
+            time.sleep(DISPLAY_SHUTDOWN_WAIT_SECONDS)
             print("\n\nStopping monitor...")
             self._save_status()  # Save status on shutdown
             print(f"\nTotal suspicious IPs detected: {len(self.detected_ips)}")
@@ -1811,7 +1829,7 @@ def _load_env_file(env_path: str) -> None:
                     value = value.strip().strip('"').strip("'")
                     if key and value and key not in os.environ:
                         os.environ[key] = value
-    except Exception:
+    except (OSError, ValueError, KeyError):
         pass
 
 
@@ -1898,7 +1916,7 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
     last_firewall_cache_update: datetime = datetime.utcnow() - timedelta(seconds=60)
 
     def _require_windows():
-        if not platform.system().lower().startswith("win"):
+        if not is_windows():
             raise HTTPException(status_code=400, detail="Firewall management is supported on Windows only")
 
     async def analyze_ip_info_only_internal(ip: str) -> None:
@@ -1942,10 +1960,10 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
     
     async def process_auto_ipinfo_analysis():
         """Background task to automatically analyze IPs with IPinfo."""
-        await asyncio.sleep(2)  # Initial delay
+        await asyncio.sleep(AUTO_ANALYZE_INITIAL_DELAY_SECONDS)
         while True:
             try:
-                await asyncio.sleep(2)  # Check queue every 2 seconds
+                await asyncio.sleep(AUTO_ANALYZE_CHECK_INTERVAL_SECONDS)
                 
                 # Get IPs from queue (thread-safe)
                 ips_to_analyze = []
@@ -1969,7 +1987,7 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
                     await asyncio.gather(*tasks, return_exceptions=True)
                         
             except Exception as e:
-                await asyncio.sleep(5)  # Wait on error
+                await asyncio.sleep(AUTO_ANALYZE_ERROR_WAIT_SECONDS)
     
     @app.on_event("startup")
     async def _startup():
@@ -1988,7 +2006,7 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
         monitor.running = False
         try:
             monitor._save_status()
-        except Exception:
+        except (sqlite3.Error, OSError):
             pass
 
     @app.get("/api/health")
@@ -2189,7 +2207,7 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
                 try:
                     error_data = response.json()
                     error_body = str(error_data)[:200]
-                except Exception:
+                except (ValueError, AttributeError, KeyError):
                     error_body = response.text[:200] if hasattr(response, 'text') else "No response body"
                 
                 error_msg = f"HTTP {response.status_code}"
@@ -2251,7 +2269,7 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
                 try:
                     error_data = response.json()
                     error_body = str(error_data)[:200]
-                except Exception:
+                except (ValueError, AttributeError, KeyError):
                     error_body = response.text[:200] if hasattr(response, 'text') else "No response body"
                 
                 error_msg = f"HTTP {response.status_code}"
@@ -2305,7 +2323,7 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
                 try:
                     error_data = response.json()
                     error_body = str(error_data)[:200]
-                except Exception:
+                except (ValueError, AttributeError, KeyError):
                     error_body = response.text[:200] if hasattr(response, 'text') else "No response body"
                 
                 error_msg = f"HTTP {response.status_code}"
@@ -2378,7 +2396,7 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
                 try:
                     error_data = response.json()
                     error_body = str(error_data)[:200]
-                except Exception:
+                except (ValueError, AttributeError, KeyError):
                     error_body = response.text[:200] if hasattr(response, 'text') else "No response body"
                 
                 error_msg = f"HTTP {response.status_code}"
@@ -2448,7 +2466,7 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
         """Save IP analysis result to cache and log it."""
         try:
             now = datetime.utcnow()
-            expires_at = now + timedelta(days=7)
+            expires_at = now + timedelta(days=IP_ANALYSIS_CACHE_EXPIRY_DAYS)
             
             result_copy = dict(result)
             result_copy.pop("cached", None)
@@ -2718,9 +2736,9 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
                             port_counter[port] += 1
 
                     # Snapshot of current firewall rule names (to mark blocked entities)
-                    # Only refresh cache every 30 seconds to avoid slow PowerShell calls
+                    # Only refresh cache periodically to avoid slow PowerShell calls
                     now_dt_ws = datetime.utcnow()
-                    if (now_dt_ws - last_firewall_cache_update).total_seconds() >= 30:
+                    if (now_dt_ws - last_firewall_cache_update).total_seconds() >= FIREWALL_CACHE_REFRESH_INTERVAL_SECONDS:
                         try:
                             rules = monitor.list_firewall_rules(prefix=firewall_prefix)
                             cached_firewall_rule_names.clear()
@@ -2729,7 +2747,7 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
                                 if name:
                                     cached_firewall_rule_names.add(name)
                             last_firewall_cache_update = now_dt_ws
-                        except Exception:
+                        except (UnicodeDecodeError, ValueError, AttributeError):
                             pass
                     rule_names = cached_firewall_rule_names
 
@@ -2851,7 +2869,7 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
                     for key, info in recent_entities.items():
                         try:
                             ts = datetime.fromisoformat(info.get("last_seen", ""))
-                        except Exception:
+                        except (ValueError, TypeError, AttributeError):
                             ts = None
                         packets_24h = info.get("packets_24h", 0) or 0
                         if not ts or ts < cutoff or packets_24h == 0:
@@ -2908,13 +2926,13 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
                     }
                     yield f"data: {json.dumps(data)}\n\n"
                     
-                    # Send keep-alive ping every 15 seconds to prevent connection timeout
+                    # Send keep-alive ping to prevent connection timeout
                     now_check = datetime.utcnow()
-                    if (now_check - last_keepalive).total_seconds() >= 15:
+                    if (now_check - last_keepalive).total_seconds() >= SSE_KEEPALIVE_INTERVAL_SECONDS:
                         yield ": keepalive\n\n"
                         last_keepalive = now_check
                     
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(SSE_UPDATE_INTERVAL_SECONDS)
             except asyncio.CancelledError:
                 yield ": connection closed\n\n"
                 raise
