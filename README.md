@@ -15,9 +15,11 @@ A Python-based network monitoring tool that uses Npcap to monitor all network tr
 - Persistent status tracking across restarts
 - Real-time console display with organized severity columns
 - Comprehensive logging to `net_monitor.log` with **daily log rotation**
-- SQLite-based status and excluded IP persistence
+- SQLite-based status and excluded IP persistence with optimized queries
 - Attack start/end detection and logging
 - IP exclusion support (manual and automatic)
+- **Automatic IPinfo integration** - Automatic IP geolocation and organization lookup for suspicious IPs
+- **Packet samples** - Captures and stores sample packets from suspicious IPs with automatic cleanup
 
 ## Prerequisites
 
@@ -42,6 +44,7 @@ Required packages:
 - `python-dotenv>=1.0.0` - Environment variable management (optional, for `.env` file support)
 - `fastapi>=0.110.0` - Web framework (optional, for `--web-ui` mode)
 - `uvicorn[standard]>=0.23.0` - ASGI server (optional, for `--web-ui` mode)
+- `httpx>=0.24.0` - HTTP client (optional, for IPinfo integration and web UI)
 
 ## Usage
 
@@ -232,6 +235,13 @@ SQLite database containing current monitoring status (saved every 60 seconds):
 - Detected IPs and subnets
 - Firewall suggestions
 - Excluded IPs with notes and timestamps
+- **IP analysis cache** - Cached IPinfo results (7-day expiry)
+
+**Database Optimizations:**
+- WAL (Write-Ahead Logging) mode enabled for better concurrency
+- Indexes on frequently queried columns
+- Batch INSERT operations for improved performance
+- Optimized queries with proper connection handling
 
 **Note**: The tool queries Windows Firewall directly to check for existing rules, ensuring consistency with the actual firewall state. Legacy JSON files (`net_monitor_status.json`, `excluded_ips.json`) are automatically migrated to SQLite on first run.
 
@@ -312,13 +322,21 @@ python net_monitor.py --web-ui --port 8080
 ```
 
 The web UI provides:
-- Real-time traffic visualization with charts
-- Severity history over time
-- Top talkers and port distribution
-- Last seen IPs and subnets (24h)
+- Real-time traffic visualization with charts (updated via Server-Sent Events)
+- Severity history over time with configurable time ranges
+- Top talkers and port distribution (5-minute aggregated windows)
+- Last seen IPs and subnets (24h) with cumulative packet counts
 - Excluded IPs management
 - Firewall rules management (Windows only)
+- **Packet samples** - View captured packet samples from suspicious IPs with IPinfo integration
 - Interactive filtering and search
+- Auto-refreshing data tables
+
+**Technical Details:**
+- Uses Server-Sent Events (SSE) for efficient real-time updates
+- Optimized database queries with indexes and batch operations
+- Firewall rule caching to minimize PowerShell calls
+- Packet samples auto-refresh every minute
 
 Access the dashboard at `http://localhost:8080` (or your configured port).
 
@@ -482,6 +500,39 @@ Or use PowerShell to tail the log:
 ```powershell
 Get-Content D:\Dev\net_monitor\net_monitor.log -Wait -Tail 50
 ```
+
+## IPinfo Integration
+
+The tool automatically integrates with IPinfo.io to provide geolocation and organization information for suspicious IPs:
+
+- **Automatic analysis**: Suspicious IPs (packet count > 500/hour) are automatically queued for IPinfo lookup
+- **Free tier support**: Works without an API key (rate-limited free tier)
+- **Optional API key**: Set `IPINFO_API_KEY` environment variable for higher rate limits
+- **Caching**: Results are cached for 7 days to minimize API calls
+- **Display**: IPinfo results appear in packet samples table with status indicators
+
+**Configuration:**
+```bash
+# Optional: Set IPinfo API key for higher rate limits
+set IPINFO_API_KEY=your_api_key_here
+```
+
+Or in `.env` file:
+```env
+IPINFO_API_KEY=your_api_key_here
+```
+
+## Packet Samples
+
+The tool automatically captures sample packets from suspicious IPs:
+
+- **Automatic capture**: Samples are captured when packet count increases significantly
+- **Rate limiting**: Only samples IPs with > 500 packets in the last hour
+- **Uniqueness**: Captures unique combinations of (source IP, destination IP, port, protocol)
+- **Storage**: Up to 10 samples per entity, stored in memory
+- **Auto-cleanup**: Samples older than 7 days are automatically removed
+- **Display**: View samples in the web UI with IPinfo integration
+- **Auto-refresh**: Packet samples table refreshes every minute
 
 ## Customization
 
