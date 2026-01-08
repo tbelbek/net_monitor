@@ -60,7 +60,8 @@ except ImportError:
     DOTENV_AVAILABLE = False
 
 try:
-    from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, HTTPException
+    from fastapi.responses import StreamingResponse
     from fastapi.staticfiles import StaticFiles
     import uvicorn
     FASTAPI_AVAILABLE = True
@@ -515,31 +516,37 @@ class NetworkMonitor:
         if not self._validate_sql_table_name(table_name):
             raise ValueError(f"Invalid table name: {table_name}")
         conn.execute(f"DELETE FROM {table_name}")
+        rows_to_insert = []
         for entity, stats in stats_dict.items():
             with stats.lock:
                 if stats.suspicion_count >= L4_THRESHOLD:
-                    conn.execute(
-                        f"""
-                        INSERT INTO {table_name} (entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            entity,
-                            stats.suspicion_count,
-                            stats.last_level,
-                            stats.first_suspicious.isoformat() if stats.first_suspicious else None,
-                            stats.last_suspicious.isoformat() if stats.last_suspicious else None,
-                            1 if stats.in_attack else 0,
-                        ),
-                    )
+                    rows_to_insert.append((
+                        entity,
+                        stats.suspicion_count,
+                        stats.last_level,
+                        stats.first_suspicious.isoformat() if stats.first_suspicious else None,
+                        stats.last_suspicious.isoformat() if stats.last_suspicious else None,
+                        1 if stats.in_attack else 0,
+                    ))
+        if rows_to_insert:
+            conn.executemany(
+                f"""
+                INSERT INTO {table_name} (entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                rows_to_insert
+            )
 
     def _save_detected_entities(self, conn: sqlite3.Connection, entities: Set[str], table_name: str) -> None:
         """Save detected entities to database table."""
         if not self._validate_sql_table_name(table_name):
             raise ValueError(f"Invalid table name: {table_name}")
         conn.execute(f"DELETE FROM {table_name}")
-        for entity in entities:
-            conn.execute(f"INSERT INTO {table_name} (entity) VALUES (?)", (entity,))
+        if entities:
+            conn.executemany(
+                f"INSERT INTO {table_name} (entity) VALUES (?)",
+                [(entity,) for entity in entities]
+            )
 
     def _save_status(self) -> None:
         """Persist monitoring status to SQLite (only L4 entities persist)."""
@@ -559,17 +566,20 @@ class NetworkMonitor:
                 self._save_detected_entities(conn, self.detected_subnets, "detected_subnets")
 
                 conn.execute("DELETE FROM firewall_suggestions")
-                for entity, info in self.firewall_suggestions.items():
-                    conn.execute(
+                if self.firewall_suggestions:
+                    conn.executemany(
                         """
                         INSERT INTO firewall_suggestions (entity, added, is_subnet)
                         VALUES (?, ?, ?)
                         """,
-                        (
-                            entity,
-                            info["added"].isoformat(),
-                            1 if info["is_subnet"] else 0,
-                        ),
+                        [
+                            (
+                                entity,
+                                info["added"].isoformat(),
+                                1 if info["is_subnet"] else 0,
+                            )
+                            for entity, info in self.firewall_suggestions.items()
+                        ]
                     )
                 conn.commit()
         except (sqlite3.Error, OSError) as e:
@@ -709,6 +719,15 @@ class NetworkMonitor:
                     ON ip_analysis_cache(expires_at)
                     """
                 )
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_excluded_ips_created_at 
+                    ON excluded_ips(created_at)
+                    """
+                )
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA cache_size=-64000")
                 conn.commit()
         except Exception as e:
             self._log(f"Error initializing status DB: {e}")
@@ -740,59 +759,73 @@ class NetworkMonitor:
                     ("last_updated", now_val),
                 )
                 conn.execute("DELETE FROM ip_stats")
-                for ip, stats_data in data.get("ip_stats", {}).items():
-                    conn.execute(
+                ip_stats_data = [
+                    (
+                        ip,
+                        stats_data.get("suspicion_count", 0),
+                        stats_data.get("last_level", 0),
+                        stats_data.get("first_suspicious"),
+                        stats_data.get("last_suspicious"),
+                        1 if stats_data.get("in_attack", False) else 0,
+                    )
+                    for ip, stats_data in data.get("ip_stats", {}).items()
+                ]
+                if ip_stats_data:
+                    conn.executemany(
                         """
                         INSERT INTO ip_stats (entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack)
                         VALUES (?, ?, ?, ?, ?, ?)
                         """,
-                        (
-                            ip,
-                            stats_data.get("suspicion_count", 0),
-                            stats_data.get("last_level", 0),
-                            stats_data.get("first_suspicious"),
-                            stats_data.get("last_suspicious"),
-                            1 if stats_data.get("in_attack", False) else 0,
-                        ),
+                        ip_stats_data
                     )
 
                 conn.execute("DELETE FROM subnet_stats")
-                for subnet, stats_data in data.get("subnet_stats", {}).items():
-                    conn.execute(
+                subnet_stats_data = [
+                    (
+                        subnet,
+                        stats_data.get("suspicion_count", 0),
+                        stats_data.get("last_level", 0),
+                        stats_data.get("first_suspicious"),
+                        stats_data.get("last_suspicious"),
+                        1 if stats_data.get("in_attack", False) else 0,
+                    )
+                    for subnet, stats_data in data.get("subnet_stats", {}).items()
+                ]
+                if subnet_stats_data:
+                    conn.executemany(
                         """
                         INSERT INTO subnet_stats (entity, suspicion_count, last_level, first_suspicious, last_suspicious, in_attack)
                         VALUES (?, ?, ?, ?, ?, ?)
                         """,
-                        (
-                            subnet,
-                            stats_data.get("suspicion_count", 0),
-                            stats_data.get("last_level", 0),
-                            stats_data.get("first_suspicious"),
-                            stats_data.get("last_suspicious"),
-                            1 if stats_data.get("in_attack", False) else 0,
-                        ),
+                        subnet_stats_data
                     )
 
                 conn.execute("DELETE FROM detected_ips")
-                for ip in data.get("detected_ips", []):
-                    conn.execute("INSERT INTO detected_ips (entity) VALUES (?)", (ip,))
+                detected_ips_data = [(ip,) for ip in data.get("detected_ips", [])]
+                if detected_ips_data:
+                    conn.executemany("INSERT INTO detected_ips (entity) VALUES (?)", detected_ips_data)
 
                 conn.execute("DELETE FROM detected_subnets")
-                for subnet in data.get("detected_subnets", []):
-                    conn.execute("INSERT INTO detected_subnets (entity) VALUES (?)", (subnet,))
+                detected_subnets_data = [(subnet,) for subnet in data.get("detected_subnets", [])]
+                if detected_subnets_data:
+                    conn.executemany("INSERT INTO detected_subnets (entity) VALUES (?)", detected_subnets_data)
 
                 conn.execute("DELETE FROM firewall_suggestions")
-                for entity, info in data.get("firewall_suggestions", {}).items():
-                    conn.execute(
+                firewall_suggestions_data = [
+                    (
+                        entity,
+                        info.get("added"),
+                        1 if info.get("is_subnet", False) else 0,
+                    )
+                    for entity, info in data.get("firewall_suggestions", {}).items()
+                ]
+                if firewall_suggestions_data:
+                    conn.executemany(
                         """
                         INSERT INTO firewall_suggestions (entity, added, is_subnet)
                         VALUES (?, ?, ?)
                         """,
-                        (
-                            entity,
-                            info.get("added"),
-                            1 if info.get("is_subnet", False) else 0,
-                        ),
+                        firewall_suggestions_data
                     )
                 conn.commit()
 
@@ -817,17 +850,16 @@ class NetworkMonitor:
                     data = json.load(f)
                 ips = data.get("excluded_ips", []) if isinstance(data, dict) else []
 
-                now_val = datetime.utcnow().isoformat()
-                for ip in ips:
-                    if not ip:
-                        continue
-                    conn.execute(
-                        """
-                        INSERT OR IGNORE INTO excluded_ips (ip, note, created_at)
-                        VALUES (?, ?, ?)
-                        """,
-                        (ip, None, now_val),
-                    )
+            now_val = datetime.utcnow().isoformat()
+            valid_ips = [(ip, None, now_val) for ip in ips if ip]
+            if valid_ips:
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO excluded_ips (ip, note, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    valid_ips
+                )
                 conn.commit()
 
             self._log(
@@ -1861,6 +1893,9 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
     window_entries_history = deque(maxlen=300)  # 5 minutes at 1 second intervals
     window_talkers_history = deque(maxlen=300)
     window_ports_history = deque(maxlen=300)
+    # Cache firewall rule names to avoid calling PowerShell on every WebSocket update
+    cached_firewall_rule_names: Set[str] = set()
+    last_firewall_cache_update: datetime = datetime.utcnow() - timedelta(seconds=60)
 
     def _require_windows():
         if not platform.system().lower().startswith("win"):
@@ -1983,7 +2018,16 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
     @app.get("/api/firewall-rules")
     def get_firewall_rules():
         _require_windows()
-        return monitor.list_firewall_rules(prefix=firewall_prefix)
+        rules = monitor.list_firewall_rules(prefix=firewall_prefix)
+        # Update cache when explicitly requested
+        nonlocal cached_firewall_rule_names, last_firewall_cache_update
+        cached_firewall_rule_names.clear()
+        for r in rules:
+            name = r.get("DisplayName") or r.get("display_name")
+            if name:
+                cached_firewall_rule_names.add(name)
+        last_firewall_cache_update = datetime.utcnow()
+        return rules
 
     @app.post("/api/firewall-rules", status_code=201)
     def add_firewall_rule(payload: dict):
@@ -1993,6 +2037,10 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
         success, was_new, display_name = monitor._add_firewall_rule(entity, is_subnet=is_subnet)
         if not success:
             raise HTTPException(status_code=500, detail="Failed to add firewall rule")
+        # Update cache when rule is added
+        if success and display_name:
+            nonlocal cached_firewall_rule_names
+            cached_firewall_rule_names.add(display_name)
         return {"display_name": display_name, "created": was_new}
 
     @app.delete("/api/firewall-rules/{display_name}")
@@ -2001,6 +2049,9 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
         removed = monitor.remove_firewall_rule(display_name)
         if not removed:
             raise HTTPException(status_code=404, detail="Firewall rule not found or could not be removed")
+        # Update cache when rule is removed
+        nonlocal cached_firewall_rule_names
+        cached_firewall_rule_names.discard(display_name)
         return {"removed": display_name}
 
     @app.get("/api/packet-samples/{entity}")
@@ -2016,27 +2067,33 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
     def list_packet_samples(page: int = 1, page_size: int = 25, search_query: Optional[str] = None):
         """List packet samples with pagination, search, and include IPinfo results."""
         all_samples = []
+        ips_to_lookup = []
+        sample_ip_map = []
+        
         for entity, samples in monitor.packet_samples.items():
             for sample in samples:
                 sample_copy = dict(sample)
                 sample_copy["entity"] = entity
-                # Get IPinfo result from cache if available
                 src_ip = sample_copy.get("src_ip") or entity
                 if src_ip and not '/' in src_ip:  # Only for IPs, not subnets
-                    try:
-                        cached_result = get_cached_analysis(src_ip)
-                        if cached_result:
-                            # Extract IPinfo service from cached result
-                            for service in cached_result.get("services", []):
-                                if service.get("service") == "IPinfo":
-                                    sample_copy["ipinfo"] = {
-                                        "status": service.get("status"),
-                                        "message": service.get("message", "")
-                                    }
-                                    break
-                    except Exception:
-                        pass
+                    ips_to_lookup.append(src_ip)
+                    sample_ip_map.append((len(all_samples), src_ip))
                 all_samples.append(sample_copy)
+        
+        # Batch fetch all IPinfo cache entries in one query
+        if ips_to_lookup:
+            cached_results = get_batch_cached_analyses(ips_to_lookup)
+            for sample_idx, src_ip in sample_ip_map:
+                cached_result = cached_results.get(src_ip)
+                if cached_result:
+                    # Extract IPinfo service from cached result
+                    for service in cached_result.get("services", []):
+                        if service.get("service") == "IPinfo":
+                            all_samples[sample_idx]["ipinfo"] = {
+                                "status": service.get("status"),
+                                "message": service.get("message", "")
+                            }
+                            break
         
         # Apply search filter if provided
         if search_query and search_query.strip():
@@ -2356,6 +2413,37 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
             monitor._log(f"Error reading IP analysis cache: {e}")
         return None
     
+    def get_batch_cached_analyses(ips: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Get cached IP analysis results for multiple IPs in a single query."""
+        if not ips:
+            return {}
+        result_map = {}
+        try:
+            with sqlite3.connect(monitor.status_db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                now = datetime.utcnow().isoformat()
+                placeholders = ','.join('?' * len(ips))
+                rows = conn.execute(
+                    f"""
+                    SELECT ip, result_json, analyzed_at, expires_at 
+                    FROM ip_analysis_cache 
+                    WHERE ip IN ({placeholders}) AND expires_at > ?
+                    """,
+                    tuple(ips) + (now,)
+                ).fetchall()
+                
+                for row in rows:
+                    try:
+                        result = json.loads(row["result_json"])
+                        result["cached"] = True
+                        result["analyzed_at"] = row["analyzed_at"]
+                        result_map[row["ip"]] = result
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+        except Exception as e:
+            monitor._log(f"Error reading batch IP analysis cache: {e}")
+        return result_map
+    
     def save_analysis_result(ip: str, result: Dict[str, Any]) -> None:
         """Save IP analysis result to cache and log it."""
         try:
@@ -2607,192 +2695,199 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
             monitor._log(f"Unexpected error in analyze_ip for {ip}: {error_msg}")
             raise HTTPException(status_code=500, detail="Internal server error")
 
-    @app.websocket("/ws/traffic")
-    async def traffic_socket(websocket: WebSocket):
-        await websocket.accept()
-        try:
-            while True:
-                raw_entries = monitor._get_current_suspicious()
-                entries = []
-                port_counter: Counter[int] = Counter()
-                for item in raw_entries:
-                    entry = dict(item)
-                    ports_set = entry.get("ports_set") or []
-                    if isinstance(ports_set, set):
-                        ports_set = sorted(list(ports_set))
-                    entry["ports_set"] = ports_set
-                    entry["ports_named"] = [get_port_name(p) for p in ports_set]
-                    entries.append(entry)
-                    for port in ports_set:
-                        port_counter[port] += 1
+    @app.get("/api/traffic-stream")
+    async def traffic_stream():
+        """Server-Sent Events stream for real-time traffic updates."""
+        async def event_generator():
+            nonlocal last_firewall_cache_update, cached_firewall_rule_names
+            last_keepalive = datetime.utcnow()
+            try:
+                while True:
+                    raw_entries = monitor._get_current_suspicious()
+                    entries = []
+                    port_counter: Counter[int] = Counter()
+                    for item in raw_entries:
+                        entry = dict(item)
+                        ports_set = entry.get("ports_set") or []
+                        if isinstance(ports_set, set):
+                            ports_set = sorted(list(ports_set))
+                        entry["ports_set"] = ports_set
+                        entry["ports_named"] = [get_port_name(p) for p in ports_set]
+                        entries.append(entry)
+                        for port in ports_set:
+                            port_counter[port] += 1
 
-                # Snapshot of current firewall rule names (to mark blocked entities)
-                rule_names = set()
-                try:
-                    rules = monitor.list_firewall_rules(prefix=firewall_prefix)
-                    for r in rules:
-                        name = r.get("DisplayName") or r.get("display_name")
-                        if name:
-                            rule_names.add(name)
-                except Exception:
-                    rule_names = set()
+                    # Snapshot of current firewall rule names (to mark blocked entities)
+                    # Only refresh cache every 30 seconds to avoid slow PowerShell calls
+                    now_dt_ws = datetime.utcnow()
+                    if (now_dt_ws - last_firewall_cache_update).total_seconds() >= 30:
+                        try:
+                            rules = monitor.list_firewall_rules(prefix=firewall_prefix)
+                            cached_firewall_rule_names.clear()
+                            for r in rules:
+                                name = r.get("DisplayName") or r.get("display_name")
+                                if name:
+                                    cached_firewall_rule_names.add(name)
+                            last_firewall_cache_update = now_dt_ws
+                        except Exception:
+                            pass
+                    rule_names = cached_firewall_rule_names
 
-                now_dt = datetime.utcnow()
-                now = now_dt.isoformat()
-                severity_counts = Counter(entry.get("level", 0) for entry in entries)
-                ip_count = sum(1 for e in entries if e.get("type") == "IP")
-                subnet_count = sum(1 for e in entries if e.get("type") == "SUBNET")
+                    now_dt = datetime.utcnow()
+                    now = now_dt.isoformat()
+                    severity_counts = Counter(entry.get("level", 0) for entry in entries)
+                    ip_count = sum(1 for e in entries if e.get("type") == "IP")
+                    subnet_count = sum(1 for e in entries if e.get("type") == "SUBNET")
 
-                # Store current snapshot in rolling window history
-                window_entries_history.append({
-                    "timestamp": now_dt.timestamp() * 1000,  # milliseconds for JS compatibility
-                    "data": entries
-                })
-                window_talkers_history.append({
-                    "timestamp": now_dt.timestamp() * 1000,
-                    "data": entries
-                })
-                window_ports_history.append({
-                    "timestamp": now_dt.timestamp() * 1000,
-                    "data": [{"port": port, "count": count} for port, count in port_counter.items()]
-                })
-                
-                # Compute aggregated data over 5-minute window (300 seconds)
-                window_cutoff = now_dt - timedelta(seconds=300)
-                window_cutoff_ts = window_cutoff.timestamp() * 1000
-                
-                # Aggregate entries for traffic table (5-minute window)
-                aggregated_entries_map = {}
-                for snapshot in window_entries_history:
-                    if snapshot["timestamp"] >= window_cutoff_ts:
-                        for e in snapshot["data"]:
-                            key = f"{e.get('entity')}_{e.get('type')}"
-                            if key not in aggregated_entries_map:
-                                aggregated_entries_map[key] = {
-                                    "entity": e.get("entity"),
-                                    "type": e.get("type"),
-                                    "level": e.get("level", 0),
-                                    "packets": 0,
-                                    "ports_set": set(),
-                                }
-                            existing = aggregated_entries_map[key]
-                            existing["packets"] += e.get("packets", 0)
-                            existing["level"] = max(existing["level"], e.get("level", 0))
-                            ports_set = e.get("ports_set", [])
-                            if isinstance(ports_set, list):
-                                existing["ports_set"].update(ports_set)
-                
-                aggregated_entries = []
-                for item in aggregated_entries_map.values():
-                    item["ports_set"] = sorted(list(item["ports_set"]))
-                    aggregated_entries.append(item)
-                aggregated_entries.sort(key=lambda x: x["packets"], reverse=True)
-                
-                # Aggregate talkers for talkers chart (5-minute window)
-                talkers_entity_map = {}
-                for snapshot in window_talkers_history:
-                    if snapshot["timestamp"] >= window_cutoff_ts:
-                        for e in snapshot["data"]:
-                            entity = e.get("entity")
-                            entity_type = e.get("type", "")
-                            if entity not in talkers_entity_map:
-                                talkers_entity_map[entity] = {
-                                    "entity": entity,
-                                    "packets": 0,
-                                    "type": entity_type,
-                                }
-                            talkers_entity_map[entity]["packets"] += e.get("packets", 0)
-                
-                top_talkers = sorted(
-                    talkers_entity_map.values(),
-                    key=lambda e: e.get("packets", 0),
-                    reverse=True
-                )[:10]  # Top 10 for frontend to process
-                
-                # Aggregate ports for ports chart (5-minute window)
-                ports_aggregated = Counter()
-                for snapshot in window_ports_history:
-                    if snapshot["timestamp"] >= window_cutoff_ts:
-                        for p in snapshot["data"]:
-                            ports_aggregated[p["port"]] += p.get("count", 0)
-                
-                top_ports = [
-                    {"port": port, "port_name": get_port_name(port), "count": count}
-                    for port, count in ports_aggregated.most_common(10)  # Top 10 for frontend
-                ]
-                
-                # Compact per-entity snapshot for history (used by per-IP charts)
-                per_entity = {}
-                for e in entries:
-                    entity = e.get("entity")
-                    if not entity:
-                        continue
-                    if e.get("type") != "IP":
-                        continue
-                    per_entity[entity] = per_entity.get(entity, 0) + (e.get("packets", 0) or 0)
-                entries_summary = [
-                    {"entity": k, "packets": v} for k, v in per_entity.items()
-                ]
+                    # Store current snapshot in rolling window history
+                    window_entries_history.append({
+                        "timestamp": now_dt.timestamp() * 1000,  # milliseconds for JS compatibility
+                        "data": entries
+                    })
+                    window_talkers_history.append({
+                        "timestamp": now_dt.timestamp() * 1000,
+                        "data": entries
+                    })
+                    window_ports_history.append({
+                        "timestamp": now_dt.timestamp() * 1000,
+                        "data": [{"port": port, "count": count} for port, count in port_counter.items()]
+                    })
+                    
+                    # Compute aggregated data over 5-minute window (300 seconds)
+                    window_cutoff = now_dt - timedelta(seconds=300)
+                    window_cutoff_ts = window_cutoff.timestamp() * 1000
+                    
+                    # Aggregate entries for traffic table (5-minute window)
+                    aggregated_entries_map = {}
+                    for snapshot in window_entries_history:
+                        if snapshot["timestamp"] >= window_cutoff_ts:
+                            for e in snapshot["data"]:
+                                key = f"{e.get('entity')}_{e.get('type')}"
+                                if key not in aggregated_entries_map:
+                                    aggregated_entries_map[key] = {
+                                        "entity": e.get("entity"),
+                                        "type": e.get("type"),
+                                        "level": e.get("level", 0),
+                                        "packets": 0,
+                                        "ports_set": set(),
+                                    }
+                                existing = aggregated_entries_map[key]
+                                existing["packets"] += e.get("packets", 0)
+                                existing["level"] = max(existing["level"], e.get("level", 0))
+                                ports_set = e.get("ports_set", [])
+                                if isinstance(ports_set, list):
+                                    existing["ports_set"].update(ports_set)
+                    
+                    aggregated_entries = []
+                    for item in aggregated_entries_map.values():
+                        item["ports_set"] = sorted(list(item["ports_set"]))
+                        aggregated_entries.append(item)
+                    aggregated_entries.sort(key=lambda x: x["packets"], reverse=True)
+                    
+                    # Aggregate talkers for talkers chart (5-minute window)
+                    talkers_entity_map = {}
+                    for snapshot in window_talkers_history:
+                        if snapshot["timestamp"] >= window_cutoff_ts:
+                            for e in snapshot["data"]:
+                                entity = e.get("entity")
+                                entity_type = e.get("type", "")
+                                if entity not in talkers_entity_map:
+                                    talkers_entity_map[entity] = {
+                                        "entity": entity,
+                                        "packets": 0,
+                                        "type": entity_type,
+                                    }
+                                talkers_entity_map[entity]["packets"] += e.get("packets", 0)
+                    
+                    top_talkers = sorted(
+                        talkers_entity_map.values(),
+                        key=lambda e: e.get("packets", 0),
+                        reverse=True
+                    )[:10]  # Top 10 for frontend to process
+                    
+                    # Aggregate ports for ports chart (5-minute window)
+                    ports_aggregated = Counter()
+                    for snapshot in window_ports_history:
+                        if snapshot["timestamp"] >= window_cutoff_ts:
+                            for p in snapshot["data"]:
+                                ports_aggregated[p["port"]] += p.get("count", 0)
+                    
+                    top_ports = [
+                        {"port": port, "port_name": get_port_name(port), "count": count}
+                        for port, count in ports_aggregated.most_common(10)  # Top 10 for frontend
+                    ]
+                    
+                    # Compact per-entity snapshot for history (used by per-IP charts)
+                    per_entity = {}
+                    for e in entries:
+                        entity = e.get("entity")
+                        if not entity:
+                            continue
+                        if e.get("type") != "IP":
+                            continue
+                        per_entity[entity] = per_entity.get(entity, 0) + (e.get("packets", 0) or 0)
+                    entries_summary = [
+                        {"entity": k, "packets": v} for k, v in per_entity.items()
+                    ]
 
-                # Per-minute aggregation for history (with IP/subnet counts and per-IP packets)
-                nonlocal last_history_bucket
-                bucket = now_dt.replace(second=0, microsecond=0).isoformat()
-                if bucket != last_history_bucket:
-                    traffic_history.append(
-                        {
-                            "ts": bucket,
-                            "severity": dict(severity_counts),
-                            "ip_count": ip_count,
-                            "subnet_count": subnet_count,
-                            "entries": entries_summary,
+                    # Per-minute aggregation for history (with IP/subnet counts and per-IP packets)
+                    nonlocal last_history_bucket
+                    bucket = now_dt.replace(second=0, microsecond=0).isoformat()
+                    if bucket != last_history_bucket:
+                        traffic_history.append(
+                            {
+                                "ts": bucket,
+                                "severity": dict(severity_counts),
+                                "ip_count": ip_count,
+                                "subnet_count": subnet_count,
+                                "entries": entries_summary,
+                            }
+                        )
+                        last_history_bucket = bucket
+
+                    # Maintain last-seen entities for the last 24 hours
+                    cutoff = now_dt - timedelta(hours=24)
+                    to_delete = []
+                    for key, info in recent_entities.items():
+                        try:
+                            ts = datetime.fromisoformat(info.get("last_seen", ""))
+                        except Exception:
+                            ts = None
+                        packets_24h = info.get("packets_24h", 0) or 0
+                        if not ts or ts < cutoff or packets_24h == 0:
+                            to_delete.append(key)
+                    for key in to_delete:
+                        recent_entities.pop(key, None)
+
+                    for e in entries:
+                        entity_key = e.get("entity")
+                        if not entity_key:
+                            continue
+                        packets_now = e.get("packets", 0) or 0
+                        display_name = monitor._get_firewall_display_name(entity_key)
+                        prev_info = recent_entities.get(entity_key, {})
+                        prev_packets = prev_info.get("packets_24h", 0)
+                        recent_entities[entity_key] = {
+                            "entity": entity_key,
+                            "type": e.get("type", ""),
+                            "last_seen": now,
+                            "last_level": e.get("level", 0),
+                            "packets_24h": prev_packets + packets_now,
+                            "has_rule": display_name in rule_names,
                         }
-                    )
-                    last_history_bucket = bucket
 
-                # Maintain last-seen entities for the last 24 hours
-                cutoff = now_dt - timedelta(hours=24)
-                to_delete = []
-                for key, info in recent_entities.items():
-                    try:
-                        ts = datetime.fromisoformat(info.get("last_seen", ""))
-                    except Exception:
-                        ts = None
-                    packets_24h = info.get("packets_24h", 0) or 0
-                    if not ts or ts < cutoff or packets_24h == 0:
-                        to_delete.append(key)
-                for key in to_delete:
-                    recent_entities.pop(key, None)
+                    recent_list = sorted(
+                        recent_entities.values(),
+                        key=lambda x: (x.get("last_level", 0), x.get("last_seen", "")),
+                        reverse=True,
+                    )[:200]
 
-                for e in entries:
-                    entity_key = e.get("entity")
-                    if not entity_key:
-                        continue
-                    packets_now = e.get("packets", 0) or 0
-                    display_name = monitor._get_firewall_display_name(entity_key)
-                    prev_info = recent_entities.get(entity_key, {})
-                    prev_packets = prev_info.get("packets_24h", 0)
-                    recent_entities[entity_key] = {
-                        "entity": entity_key,
-                        "type": e.get("type", ""),
-                        "last_seen": now,
-                        "last_level": e.get("level", 0),
-                        "packets_24h": prev_packets + packets_now,
-                        "has_rule": display_name in rule_names,
-                    }
-
-                recent_list = sorted(
-                    recent_entities.values(),
-                    key=lambda x: (x.get("last_level", 0), x.get("last_seen", "")),
-                    reverse=True,
-                )[:200]
-
-                # Limit severity history to last 500 entries for performance (frontend will limit further)
-                history_list = list(traffic_history)
-                if len(history_list) > 500:
-                    history_list = history_list[-500:]
-                
-                await websocket.send_json(
-                    {
+                    # Limit severity history to last 500 entries for performance (frontend will limit further)
+                    history_list = list(traffic_history)
+                    if len(history_list) > 500:
+                        history_list = history_list[-500:]
+                    
+                    data = {
                         "timestamp": now,
                         "window_seconds": monitor.window.total_seconds(),
                         "max_packets": monitor.max_packets,
@@ -2811,12 +2906,34 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
                         "top_ports": top_ports,
                         "recent_entities": recent_list,
                     }
-                )
+                    yield f"data: {json.dumps(data)}\n\n"
+                    
+                    # Send keep-alive ping every 15 seconds to prevent connection timeout
+                    now_check = datetime.utcnow()
+                    if (now_check - last_keepalive).total_seconds() >= 15:
+                        yield ": keepalive\n\n"
+                        last_keepalive = now_check
+                    
+                    await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                yield ": connection closed\n\n"
+                raise
+            except Exception as e:
+                monitor._log(f"SSE stream error: {e}", "ERROR")
+                # Send error as comment and continue
+                yield f": error {str(e)[:100]}\n\n"
                 await asyncio.sleep(1)
-        except WebSocketDisconnect:
-            return
-        except Exception:
-            await asyncio.sleep(1)
+        
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "Keep-Alive": "timeout=60",
+            }
+        )
 
     static_dir = os.path.join(os.path.dirname(__file__), "static")
     if os.path.isdir(static_dir):

@@ -155,8 +155,13 @@
 
       <!-- Row 5: Packet Samples -->
       <div class="card">
-        <h3>Packet Samples</h3>
-        <p style="margin-top:0; margin-bottom:12px;">Sample packets captured from suspicious IPs (samples older than 7 days are automatically removed)</p>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+          <div>
+            <h3 style="margin:0;">Packet Samples</h3>
+            <p style="margin-top:4px; margin-bottom:0;">Sample packets captured from suspicious IPs (samples older than 7 days are automatically removed)</p>
+          </div>
+          <button id="refresh-packets" class="primary">Refresh</button>
+        </div>
         <div style="margin-bottom:12px;">
           <p style="color:#7f8c8d; font-size:13px; margin:0;">Use the search box above the table to filter samples by any column.</p>
         </div>
@@ -204,7 +209,6 @@
     let exclusionsTable = null;
     let firewallTable = null;
     let packetSamplesTable = null;
-    let packetSamplesRefreshInterval = null;
 
     // Performance optimization: debounce/throttle utilities
     function debounce(func, wait) {
@@ -775,20 +779,86 @@ AS: ${data.as || 'N/A'}
       if (data.recent_entities) renderRecentEntities(data.recent_entities);
     }
 
-    function connectWebSocket() {
-      const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/traffic`);
-      ws.onmessage = (ev) => {
-        try {
-          const data = JSON.parse(ev.data);
-          processWebSocketUpdate(data);
-        } catch (e) {
-          console.error('Failed to parse WebSocket message:', e);
-        }
-      };
-      ws.onclose = () => setTimeout(connectWebSocket, 2000);
-      ws.onerror = (err) => console.error('WebSocket error:', err);
+    let eventSource = null;
+    let reconnectTimeout = null;
+    let reconnectAttempts = 0;
+    const MAX_RECONNECT_ATTEMPTS = 10;
+    const INITIAL_RECONNECT_DELAY = 1000;
+    
+    function connectEventSource() {
+      if (eventSource && eventSource.readyState !== EventSource.CLOSED) {
+        return;
+      }
+      
+      if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        console.error('Max reconnection attempts reached. Please refresh the page.');
+        return;
+      }
+      
+      try {
+        eventSource = new EventSource('/api/traffic-stream');
+        
+        eventSource.onopen = () => {
+          console.log('SSE connection opened');
+          reconnectAttempts = 0;
+          if (reconnectTimeout) {
+            clearTimeout(reconnectTimeout);
+            reconnectTimeout = null;
+          }
+        };
+        
+        eventSource.onmessage = (ev) => {
+          try {
+            // Skip keepalive comments
+            if (ev.data.trim().startsWith(':')) {
+              return;
+            }
+            const data = JSON.parse(ev.data);
+            processWebSocketUpdate(data);
+          } catch (e) {
+            // Ignore JSON parse errors for keepalive messages
+            if (!ev.data.trim().startsWith(':')) {
+              console.error('Failed to parse SSE message:', e);
+            }
+          }
+        };
+        
+        eventSource.onerror = (err) => {
+          const state = eventSource.readyState;
+          if (state === EventSource.CLOSED) {
+            console.log('SSE connection closed, reconnecting...');
+            eventSource.close();
+            eventSource = null;
+            
+            // Exponential backoff for reconnection
+            const delay = Math.min(INITIAL_RECONNECT_DELAY * Math.pow(2, reconnectAttempts), 30000);
+            reconnectAttempts++;
+            reconnectTimeout = setTimeout(() => {
+              connectEventSource();
+            }, delay);
+          } else if (state === EventSource.CONNECTING) {
+            console.log('SSE reconnecting...');
+          }
+        };
+      } catch (e) {
+        console.error('Error creating EventSource:', e);
+        reconnectAttempts++;
+        reconnectTimeout = setTimeout(() => {
+          connectEventSource();
+        }, INITIAL_RECONNECT_DELAY * Math.pow(2, reconnectAttempts));
+      }
     }
-    connectWebSocket();
+    connectEventSource();
+    
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', () => {
+      if (eventSource) {
+        eventSource.close();
+      }
+      if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+      }
+    });
 
     document.getElementById('history-range').addEventListener('change', () => {
       updateSpanLabels();
@@ -824,10 +894,12 @@ AS: ${data.as || 'N/A'}
     }
     
     // Defer heavy initial loads - load after page is interactive
+    // Load exclusions immediately (fast DB query)
+    loadExclusions();
+    // Defer firewall rules (slow PowerShell call) until after page is fully loaded
     setTimeout(() => {
-      loadExclusions();
       loadFirewall();
-    }, 1000);
+    }, 3000);
 
     document.getElementById('exclusion-form').addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -899,6 +971,14 @@ AS: ${data.as || 'N/A'}
     }
 
     document.getElementById('refresh-firewall').addEventListener('click', loadFirewall);
+
+    document.getElementById('refresh-packets').addEventListener('click', () => {
+      if (packetSamplesTable) {
+        packetSamplesTable.ajax.reload(null, false);
+      } else {
+        loadPacketSamples();
+      }
+    });
 
     function formatPacketSample(s) {
       const timestamp = s.timestamp ? new Date(s.timestamp).toLocaleString() : 'N/A';
@@ -1028,15 +1108,6 @@ AS: ${data.as || 'N/A'}
             drawCallback: function() {
             }
           });
-          
-          // Start auto-refresh every 15 seconds
-          if (!packetSamplesRefreshInterval) {
-            packetSamplesRefreshInterval = setInterval(() => {
-              if (packetSamplesTable) {
-                packetSamplesTable.ajax.reload(null, false);
-              }
-            }, 15000);
-          }
         } else {
           // Reload existing server-side table
           packetSamplesTable.ajax.reload(null, false);
