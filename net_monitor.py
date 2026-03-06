@@ -29,7 +29,9 @@ from scapy.all import get_if_list, sniff, IP, TCP, UDP
 BASE_SUSPICION_COUNT = 8
 L4_SEVERITY_LEVEL = 4
 L3_SEVERITY_LEVEL = 3
+L2_SEVERITY_LEVEL = 2
 L1_THRESHOLD = BASE_SUSPICION_COUNT  # BASE^1
+PACKETS_PER_MINUTE_BLOCK_THRESHOLD = 100  # Auto-block if pkts/min > this and severity >= L2
 L2_THRESHOLD = BASE_SUSPICION_COUNT ** 2  # BASE^3
 L3_THRESHOLD = BASE_SUSPICION_COUNT ** 3  # BASE^6
 L4_THRESHOLD = BASE_SUSPICION_COUNT ** 4  # BASE^9
@@ -1601,6 +1603,12 @@ The {entity_type.lower()} has been automatically blocked due to reaching L4 seve
         
         if should_alert and severity >= L4_SEVERITY_LEVEL:
             self._handle_firewall_block(src_ip, is_subnet=False, now=now)
+        elif self.auto_block and severity >= L2_SEVERITY_LEVEL:
+            with stats_ip.lock:
+                packet_count = len(stats_ip.packet_times)
+            packets_per_minute = packet_count * 60 / self.window.total_seconds()
+            if packets_per_minute > PACKETS_PER_MINUTE_BLOCK_THRESHOLD:
+                self._handle_firewall_block(src_ip, is_subnet=False, now=now)
 
         if subnet_key and stats_subnet is not None:
             subnet_severity, subnet_alert = self._process_entity_stats(
@@ -1611,6 +1619,12 @@ The {entity_type.lower()} has been automatically blocked due to reaching L4 seve
             
             if subnet_alert and subnet_severity >= L4_SEVERITY_LEVEL:
                 self._handle_firewall_block(subnet_key, is_subnet=True, now=now)
+            elif self.auto_block and subnet_severity >= L2_SEVERITY_LEVEL:
+                with stats_subnet.lock:
+                    packet_count = len(stats_subnet.packet_times)
+                packets_per_minute = packet_count * 60 / self.window.total_seconds()
+                if packets_per_minute > PACKETS_PER_MINUTE_BLOCK_THRESHOLD:
+                    self._handle_firewall_block(subnet_key, is_subnet=True, now=now)
     
     def _check_entity_suspicious(self, stats: IpStats, now: datetime) -> Optional[Dict[str, Any]]:
         """Check if an entity (IP or subnet) is currently suspicious. Returns entity dict or None."""
