@@ -2800,7 +2800,17 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
                     # Compute aggregated data over 5-minute window (300 seconds)
                     window_cutoff = now_dt - timedelta(seconds=300)
                     window_cutoff_ts = window_cutoff.timestamp() * 1000
-                    
+                    last_minute_cutoff_ts = (now_dt - timedelta(seconds=60)).timestamp() * 1000
+
+                    # Packets per entity in the last 60 seconds (for Last Seen Pkts/s)
+                    packets_last_minute = {}
+                    for snapshot in window_entries_history:
+                        if snapshot["timestamp"] >= last_minute_cutoff_ts:
+                            for e in snapshot["data"]:
+                                key = e.get("entity")
+                                if key:
+                                    packets_last_minute[key] = packets_last_minute.get(key, 0) + (e.get("packets", 0) or 0)
+
                     # Aggregate entries for traffic table (5-minute window)
                     aggregated_entries_map = {}
                     for snapshot in window_entries_history:
@@ -2825,6 +2835,7 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
                     aggregated_entries = []
                     for item in aggregated_entries_map.values():
                         item["ports_set"] = sorted(list(item["ports_set"]))
+                        item["packets_per_sec"] = round(item["packets"] / 300, 1)
                         aggregated_entries.append(item)
                     aggregated_entries.sort(key=lambda x: x["packets"], reverse=True)
                     
@@ -2843,11 +2854,15 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
                                     }
                                 talkers_entity_map[entity]["packets"] += e.get("packets", 0)
                     
-                    top_talkers = sorted(
+                    top_talkers_raw = sorted(
                         talkers_entity_map.values(),
                         key=lambda e: e.get("packets", 0),
                         reverse=True
-                    )[:10]  # Top 10 for frontend to process
+                    )[:10]
+                    top_talkers = [
+                        {**t, "packets_per_sec": round((t.get("packets") or 0) / 300, 1)}
+                        for t in top_talkers_raw
+                    ]
                     
                     # Aggregate ports for ports chart (5-minute window)
                     ports_aggregated = Counter()
@@ -2920,11 +2935,18 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
                             "has_rule": display_name in rule_names,
                         }
 
-                    recent_list = sorted(
+                    recent_list_sorted = sorted(
                         recent_entities.values(),
                         key=lambda x: (x.get("last_level", 0), x.get("last_seen", "")),
                         reverse=True,
                     )[:200]
+                    recent_list = [
+                        {
+                            **r,
+                            "packets_per_sec": round(packets_last_minute.get(r.get("entity"), 0) / 60, 1),
+                        }
+                        for r in recent_list_sorted
+                    ]
 
                     # Limit severity history to last 500 entries for performance (frontend will limit further)
                     history_list = list(traffic_history)
@@ -2943,6 +2965,7 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
                             {
                                 "entity": t["entity"],
                                 "packets": t.get("packets", 0),
+                                "packets_per_sec": t.get("packets_per_sec", 0),
                                 "type": t.get("type", ""),
                             }
                             for t in top_talkers

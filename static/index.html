@@ -75,7 +75,7 @@
           <p style="margin-top:0; margin-bottom:8px; color:#7f8c8d; font-size:12px;">Entities currently exceeding thresholds (aggregated over 5 minutes)</p>
           <table id="traffic-table">
             <thead>
-              <tr><th>Severity</th><th>Entity</th><th>Packets</th><th>Ports</th><th>Type</th></tr>
+              <tr><th>Severity</th><th>Entity</th><th>Packets</th><th>Pkts/s</th><th>Ports</th><th>Type</th></tr>
             </thead>
             <tbody></tbody>
           </table>
@@ -109,7 +109,7 @@
         <div class="last-seen-container">
           <table id="recent-entities-table">
             <thead>
-              <tr><th>Severity</th><th>Entity</th><th>Type</th><th>Packets (24h)</th><th>Last Seen</th><th>Firewall</th><th>Actions</th></tr>
+              <tr><th>Severity</th><th>Entity</th><th>Type</th><th>Packets (24h)</th><th>Pkts/s (1m avg)</th><th>Last Seen</th><th>Firewall</th><th>Actions</th></tr>
             </thead>
             <tbody></tbody>
           </table>
@@ -282,6 +282,14 @@
                 const label = context.dataset.label || '';
                 const value = context.parsed.y;
                 return label ? `${label}: ${value}` : `${value}`;
+              },
+              afterBody: function(context) {
+                const dataIndex = context[0]?.dataIndex;
+                if (dataIndex == null) return '';
+                let total = 0;
+                context.forEach(c => { total += c.parsed.y || 0; });
+                const pps = (total / 300).toFixed(1);
+                return total > 0 ? `Total: ${total} packets (${pps} pkts/s)` : '';
               }
             }
           }
@@ -396,10 +404,12 @@
           portsText = portsText.slice(0, 57) + '...';
         }
         const pillClass = `pill l${e.level || 0}`;
+        const pps = e.packets_per_sec != null ? e.packets_per_sec : (e.packets != null ? (e.packets / 300).toFixed(1) : '');
         return [
           `<span class="${pillClass}">L${e.level || 0}</span>`,
           e.entity,
           e.packets,
+          pps,
           portsText,
           e.type
         ];
@@ -592,6 +602,7 @@
         const pillClass = `pill l${item.last_level || 0}`;
         const typeText = item.type === 'SUBNET' ? 'Subnet' : 'IP';
         const packets = item.packets_24h || 0;
+        const pps = item.packets_per_sec != null ? item.packets_per_sec : '';
         const firewallText = item.has_rule ? 'Blocked' : '';
         const lastSeen = item.last_seen ? new Date(item.last_seen).toLocaleString() : '';
         const entityId = item.entity;
@@ -610,6 +621,7 @@
           item.entity,
           typeText,
           packets,
+          pps,
           lastSeen,
           firewallText,
           `<button class="secondary recent-exclude" data-entity="${entityId}">Exclude</button> <button class="secondary recent-block" data-entity="${entityId}" data-type="${item.type}">Block</button> ${locationButton}`
@@ -700,9 +712,9 @@ AS: ${data.as || 'N/A'}
         recentEntitiesTable.column(2).search(typeFilter ? '^' + typeFilter + '$' : '', true, false);
         recentEntitiesTable.column(0).search(severityFilter ? severityFilter : '', true, false);
         if (firewallFilter === 'NOT_BLOCKED') {
-          recentEntitiesTable.column(5).search('^$', true, false);
+          recentEntitiesTable.column(6).search('^$', true, false);
         } else {
-          recentEntitiesTable.column(5).search(firewallFilter ? '^' + firewallFilter + '$' : '', true, false);
+          recentEntitiesTable.column(6).search(firewallFilter ? '^' + firewallFilter + '$' : '', true, false);
         }
         recentEntitiesTable.draw();
         attachRecentEntityHandlers();
@@ -713,8 +725,8 @@ AS: ${data.as || 'N/A'}
           scrollY: '400px',
           scrollCollapse: true,
           dom: '<"top"lf<"clear">>rt<"bottom"ip<"clear">>',
-          columnDefs: [{ targets: [0, 6], orderable: false, render: function(data) { return data; } }],
-          htmlColumns: [0, 6],
+          columnDefs: [{ targets: [0, 7], orderable: false, render: function(data) { return data; } }],
+          htmlColumns: [0, 7],
           drawCallback: attachRecentEntityHandlers,
           initComplete: function() {
             let filterContainer = document.getElementById('recent-filters');
