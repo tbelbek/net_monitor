@@ -2052,7 +2052,7 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
             raise HTTPException(status_code=400, detail="Invalid IP or failed to save exclusion")
         return {"ip": ip, "note": note}
 
-    @app.delete("/api/exclusions/{ip}")
+    @app.delete("/api/exclusions/{ip:path}")
     def delete_exclusion(ip: str):
         removed = monitor.remove_excluded_ip(ip)
         if not removed:
