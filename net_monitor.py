@@ -299,13 +299,36 @@ class NetworkMonitor:
         return f"{FIREWALL_PREFIX}{entity.replace('/', '_').replace('.', '_')}"
     
     def _validate_ip(self, ip: str) -> bool:
-        """Validate that a string is a valid IP address. Returns True if valid, False otherwise."""
+        """Validate that a string is a valid IP address or CIDR network. Returns True if valid, False otherwise."""
         try:
             ipaddress.ip_address(ip)
             return True
         except ValueError:
+            pass
+        try:
+            ipaddress.ip_network(ip, strict=False)
+            return True
+        except ValueError:
             return False
-    
+
+    def _is_ip_excluded(self, ip: str) -> bool:
+        """Return True if the IP is in exclude_ips (exact) or falls inside any excluded CIDR."""
+        if ip in self.exclude_ips:
+            return True
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        for entry in self.exclude_ips:
+            if "/" in entry:
+                try:
+                    net = ipaddress.ip_network(entry, strict=False)
+                    if addr in net:
+                        return True
+                except ValueError:
+                    continue
+        return False
+
     def _sanitize_log_message(self, message: str) -> str:
         """Sanitize sensitive data in log messages."""
         import re
@@ -989,7 +1012,7 @@ class NetworkMonitor:
         display_name = self._get_firewall_display_name(entity)
         
         if not is_subnet:
-            if entity in self.exclude_ips:
+            if self._is_ip_excluded(entity):
                 if entity not in self.logged_skip_entities:
                     self._log(f"FIREWALL_SKIP {entity} (in excluded IPs list)")
                     self.logged_skip_entities.add(entity)
@@ -1346,7 +1369,7 @@ class NetworkMonitor:
                 try:
                     # Only queue public IPs (not private, loopback, link-local)
                     if not self._is_private_ip(entity):
-                        if entity not in self.exclude_ips:
+                        if not self._is_ip_excluded(entity):
                             # Rate limiting: only queue if not analyzed recently (60 seconds)
                             last_analyze = self.last_auto_analyze_times.get(entity)
                             if not last_analyze or (now - last_analyze).total_seconds() >= 60:
@@ -1552,7 +1575,7 @@ The {entity_type.lower()} has been automatically blocked due to reaching L4 seve
         dst_ip = ip_layer.dst
 
         # Skip traffic sourced from excluded IPs (e.g., host's public IP or self IPs)
-        if src_ip in self.exclude_ips:
+        if self._is_ip_excluded(src_ip):
             return
 
         dst_port = None
@@ -1923,8 +1946,8 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
         """Internal function to analyze IP with IPinfo (same logic as endpoint but no return)."""
         try:
             is_private = monitor._is_private_ip(ip)
-            is_excluded = ip in monitor.exclude_ips
-            
+            is_excluded = monitor._is_ip_excluded(ip)
+
             # Skip private/excluded IPs
             if is_private or is_excluded:
                 return
@@ -2603,8 +2626,8 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
         Only called when user explicitly requests analysis - no automatic API calls."""
         try:
             is_private = monitor._is_private_ip(ip)
-            is_excluded = ip in monitor.exclude_ips
-            
+            is_excluded = monitor._is_ip_excluded(ip)
+
             # Return immediately for private/excluded IPs without any analysis or cache operations
             if is_private:
                 return {
