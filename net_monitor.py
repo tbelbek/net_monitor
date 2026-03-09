@@ -45,6 +45,7 @@ DISPLAY_SHUTDOWN_WAIT_SECONDS = 1.5
 SSE_UPDATE_INTERVAL_SECONDS = 1
 SSE_KEEPALIVE_INTERVAL_SECONDS = 15
 FIREWALL_CACHE_REFRESH_INTERVAL_SECONDS = 30
+FIREWALL_LIST_TIMEOUT_SECONDS = 60
 AUTO_ANALYZE_INITIAL_DELAY_SECONDS = 2
 AUTO_ANALYZE_CHECK_INTERVAL_SECONDS = 2
 AUTO_ANALYZE_ERROR_WAIT_SECONDS = 5
@@ -414,15 +415,16 @@ class NetworkMonitor:
         escaped_prefix = self._escape_powershell_argument(prefix + "*")
         return [
             "powershell", "-Command",
-            f"Get-NetFirewallRule -DisplayName {escaped_prefix} | ForEach-Object {{ "
+            f"Get-NetFirewallRule -DisplayName {escaped_prefix} -ErrorAction SilentlyContinue | ForEach-Object {{ "
             f"$rule=$_; "
-            f"$addr = Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $rule; "
+            f"$addr=Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $rule -ErrorAction SilentlyContinue; "
+            f"$remoteAddr=''; if($addr -and $addr.RemoteAddress){{$remoteAddr=($addr.RemoteAddress -join ',')}}; "
             f"[PSCustomObject]@{{ "
             f"DisplayName=$rule.DisplayName; "
             f"Direction=$rule.Direction; "
             f"Action=$rule.Action; "
             f"Enabled=$rule.Enabled; "
-            f"RemoteAddress=($addr.RemoteAddress -join ',') "
+            f"RemoteAddress=$remoteAddr "
             f"}} "
             f"}} | ConvertTo-Json"
         ]
@@ -1074,19 +1076,39 @@ class NetworkMonitor:
         """List Windows Firewall rules matching the provided display name prefix."""
         if not is_windows():
             return []
-        
+
         try:
             cmd = self._build_powershell_list_rules_cmd(prefix)
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=FIREWALL_LIST_TIMEOUT_SECONDS,
+            )
             if result.returncode != 0:
-                self._log(f"FIREWALL_LIST_ERROR stderr={result.stderr}")
+                out = (result.stdout or "").strip()[:400]
+                self._log(f"FIREWALL_LIST_CMD (failed) {subprocess.list2cmdline(cmd)}")
+                msg = f"FIREWALL_LIST_ERROR returncode={result.returncode}"
+                if out:
+                    msg += f" output={out!r}"
+                else:
+                    msg += " output=(none); run as Administrator or check: Get-NetFirewallRule -DisplayName 'Block_Attacker_*'"
+                self._log(msg)
                 return []
 
             output = result.stdout.strip()
             if not output:
                 return []
 
-            parsed = json.loads(output)
+            try:
+                parsed = json.loads(output)
+            except json.JSONDecodeError as e:
+                self._log(f"FIREWALL_LIST_CMD (failed) {subprocess.list2cmdline(cmd)}")
+                sample = (output[:500] + "..." if len(output) > 500 else output) or "(empty)"
+                self._log(f"FIREWALL_LIST_JSON_ERROR {e} output={sample!r}", "ERROR")
+                return []
+
             if isinstance(parsed, dict):
                 parsed = [parsed]
             if not isinstance(parsed, list):
@@ -1130,9 +1152,15 @@ class NetworkMonitor:
                 normalized.append(norm_rule)
             return normalized
         except subprocess.TimeoutExpired:
+            self._log(f"FIREWALL_LIST_CMD (timeout) {subprocess.list2cmdline(cmd)}")
             self._log("FIREWALL_LIST_TIMEOUT", "WARNING")
             return []
-        except (ValueError, subprocess.SubprocessError, json.JSONDecodeError) as e:
+        except (ValueError, subprocess.SubprocessError) as e:
+            try:
+                cmd = self._build_powershell_list_rules_cmd(prefix)
+                self._log(f"FIREWALL_LIST_CMD (exception) {subprocess.list2cmdline(cmd)}")
+            except Exception:
+                pass
             self._log(f"FIREWALL_LIST_EXCEPTION error={e}", "ERROR")
             return []
 
@@ -1651,27 +1679,63 @@ The {entity_type.lower()} has been automatically blocked due to reaching L4 seve
         return None
 
     def _get_current_suspicious(self) -> List[Dict[str, Any]]:
-        """Get current suspicious IPs and subnets with their stats"""
+        """Get current suspicious IPs and subnets with their stats. Uses snapshot of dict items to avoid 'dictionary changed size during iteration' when packet thread adds keys concurrently."""
         now = datetime.utcnow()
         suspicious = []
-        
-        for ip, stats in self.stats.items():
+        for ip, stats in list(self.stats.items()):
             entity_data = self._check_entity_suspicious(stats, now)
             if entity_data:
                 entity_data['entity'] = ip
                 entity_data['type'] = 'IP'
                 suspicious.append(entity_data)
-        
-        for subnet, stats in self.subnet_stats.items():
+        for subnet, stats in list(self.subnet_stats.items()):
             entity_data = self._check_entity_suspicious(stats, now)
             if entity_data:
                 entity_data['entity'] = subnet
                 entity_data['type'] = 'SUBNET'
                 suspicious.append(entity_data)
-        
         suspicious.sort(key=lambda x: (x['level'], x['packets']), reverse=True)
         return suspicious
-    
+
+    def _get_current_talkers(self, min_packets: int = 1, max_entities: int = 50) -> List[Dict[str, Any]]:
+        """Return top entities by packet count in current window (any activity). Used when no entities are suspicious so the UI still shows traffic."""
+        now = datetime.utcnow()
+        talkers = []
+        for ip, stats in list(self.stats.items()):
+            with stats.lock:
+                while stats.packet_times and now - stats.packet_times[0] > self.window:
+                    stats.packet_times.popleft()
+                packet_count = len(stats.packet_times)
+            if packet_count >= min_packets:
+                with stats.lock:
+                    talkers.append({
+                        "entity": ip,
+                        "type": "IP",
+                        "level": stats.last_level,
+                        "packets": packet_count,
+                        "ports": len(stats.dst_ports),
+                        "ports_set": sorted(list(stats.dst_ports)),
+                        "active": False,
+                    })
+        for subnet, stats in list(self.subnet_stats.items()):
+            with stats.lock:
+                while stats.packet_times and now - stats.packet_times[0] > self.window:
+                    stats.packet_times.popleft()
+                packet_count = len(stats.packet_times)
+            if packet_count >= min_packets:
+                with stats.lock:
+                    talkers.append({
+                        "entity": subnet,
+                        "type": "SUBNET",
+                        "level": stats.last_level,
+                        "packets": packet_count,
+                        "ports": len(stats.dst_ports),
+                        "ports_set": sorted(list(stats.dst_ports)),
+                        "active": False,
+                    })
+        talkers.sort(key=lambda x: x["packets"], reverse=True)
+        return talkers[:max_entities]
+
     def _periodic_save(self) -> None:
         """Periodically save status to file"""
         while self.running:
@@ -1950,6 +2014,7 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
     window_ports_history = deque(maxlen=300)
     # Cache firewall rule names to avoid calling PowerShell on every WebSocket update
     cached_firewall_rule_names: Set[str] = set()
+    firewall_refresh_task = None  # in-flight refresh; SSE does not wait for it
     last_firewall_cache_update: datetime = datetime.utcnow() - timedelta(seconds=60)
 
     def _require_windows():
@@ -2074,9 +2139,9 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
         return {"removed": ip}
 
     @app.get("/api/firewall-rules")
-    def get_firewall_rules():
+    async def get_firewall_rules():
         _require_windows()
-        rules = monitor.list_firewall_rules(prefix=firewall_prefix)
+        rules = await asyncio.to_thread(monitor.list_firewall_rules, prefix=firewall_prefix)
         # Update cache when explicitly requested
         nonlocal cached_firewall_rule_names, last_firewall_cache_update
         cached_firewall_rule_names.clear()
@@ -2756,12 +2821,27 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
     @app.get("/api/traffic-stream")
     async def traffic_stream():
         """Server-Sent Events stream for real-time traffic updates."""
-        async def event_generator():
+        async def refresh_firewall_cache_background():
             nonlocal last_firewall_cache_update, cached_firewall_rule_names
+            try:
+                rules = await asyncio.to_thread(monitor.list_firewall_rules, prefix=firewall_prefix)
+                cached_firewall_rule_names.clear()
+                for r in rules:
+                    name = r.get("DisplayName") or r.get("display_name")
+                    if name:
+                        cached_firewall_rule_names.add(name)
+                last_firewall_cache_update = datetime.utcnow()
+            except (UnicodeDecodeError, ValueError, AttributeError):
+                pass
+
+        async def event_generator():
+            nonlocal last_firewall_cache_update, cached_firewall_rule_names, firewall_refresh_task
             last_keepalive = datetime.utcnow()
             try:
                 while True:
                     raw_entries = monitor._get_current_suspicious()
+                    if not raw_entries:
+                        raw_entries = monitor._get_current_talkers(min_packets=1, max_entities=50)
                     entries = []
                     port_counter: Counter[int] = Counter()
                     for item in raw_entries:
@@ -2775,20 +2855,12 @@ def create_web_app(monitor: NetworkMonitor, interface_id: Optional[str] = None, 
                         for port in ports_set:
                             port_counter[port] += 1
 
-                    # Snapshot of current firewall rule names (to mark blocked entities)
-                    # Only refresh cache periodically to avoid slow PowerShell calls
+                    # Refresh firewall rule cache in background so SSE stream never blocks on it
                     now_dt_ws = datetime.utcnow()
                     if (now_dt_ws - last_firewall_cache_update).total_seconds() >= FIREWALL_CACHE_REFRESH_INTERVAL_SECONDS:
-                        try:
-                            rules = monitor.list_firewall_rules(prefix=firewall_prefix)
-                            cached_firewall_rule_names.clear()
-                            for r in rules:
-                                name = r.get("DisplayName") or r.get("display_name")
-                                if name:
-                                    cached_firewall_rule_names.add(name)
+                        if firewall_refresh_task is None or firewall_refresh_task.done():
                             last_firewall_cache_update = now_dt_ws
-                        except (UnicodeDecodeError, ValueError, AttributeError):
-                            pass
+                            firewall_refresh_task = asyncio.create_task(refresh_firewall_cache_background())
                     rule_names = cached_firewall_rule_names
 
                     now_dt = datetime.utcnow()
