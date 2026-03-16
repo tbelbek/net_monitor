@@ -46,6 +46,10 @@ SSE_UPDATE_INTERVAL_SECONDS = 1
 SSE_KEEPALIVE_INTERVAL_SECONDS = 15
 FIREWALL_CACHE_REFRESH_INTERVAL_SECONDS = 30
 FIREWALL_LIST_TIMEOUT_SECONDS = 60
+FIREWALL_LIST_MAX_RULES = 10000
+MAX_FIREWALL_BLOCK_EMAILS_SENT = 20000
+MAX_LOGGED_SKIP_ENTITIES = 10000
+MAX_EMAIL_SKIP_LOGGED = 5000
 AUTO_ANALYZE_INITIAL_DELAY_SECONDS = 2
 AUTO_ANALYZE_CHECK_INTERVAL_SECONDS = 2
 AUTO_ANALYZE_ERROR_WAIT_SECONDS = 5
@@ -149,7 +153,8 @@ class NetworkMonitor:
         self.display_lock = Lock()
         self.firewall_suggestions = {}  # entity -> {"added": datetime, "is_subnet": bool}
         self.logged_skip_entities = set()  # Track entities that have been logged as skipped
-        self.firewall_block_emails_sent = set()  # Track entities that have had firewall block emails sent
+        self.firewall_block_emails_sent = set()
+        self._firewall_block_emails_sent_order = deque()
         self.email_skip_logged = set()  # Track entities for which we've logged email skip messages (to avoid log spam)
         self.packet_samples = {}  # entity -> list of sample packet info
         self.sampled_combinations = {}  # entity -> set of (src_ip, dst_ip, dst_port, proto) tuples
@@ -426,7 +431,7 @@ class NetworkMonitor:
             f"Enabled=$rule.Enabled; "
             f"RemoteAddress=$remoteAddr "
             f"}} "
-            f"}} | ConvertTo-Json"
+            f"}} | Select-Object -First {FIREWALL_LIST_MAX_RULES} | ConvertTo-Json"
         ]
     
     def _build_powershell_remove_rule_cmd(self, display_name: str) -> List[str]:
@@ -1019,6 +1024,8 @@ class NetworkMonitor:
             if self._is_ip_excluded(entity):
                 if entity not in self.logged_skip_entities:
                     self._log(f"FIREWALL_SKIP {entity} (in excluded IPs list)")
+                    if len(self.logged_skip_entities) >= MAX_LOGGED_SKIP_ENTITIES:
+                        self.logged_skip_entities.clear()
                     self.logged_skip_entities.add(entity)
                 return (True, False, display_name)
         else:
@@ -1029,12 +1036,16 @@ class NetworkMonitor:
                     if excluded_prefix and excluded_prefix == subnet_prefix:
                         if entity not in self.logged_skip_entities:
                             self._log(f"FIREWALL_SKIP {entity} (subnet contains excluded IP {excluded_ip})")
+                            if len(self.logged_skip_entities) >= MAX_LOGGED_SKIP_ENTITIES:
+                                self.logged_skip_entities.clear()
                             self.logged_skip_entities.add(entity)
                         return (True, False, display_name)
         
         if not is_windows():
             if entity not in self.logged_skip_entities:
                 self._log(f"FIREWALL_SKIP {entity} (not Windows)")
+                if len(self.logged_skip_entities) >= MAX_LOGGED_SKIP_ENTITIES:
+                    self.logged_skip_entities.clear()
                 self.logged_skip_entities.add(entity)
             return (False, False, display_name)
         
@@ -1048,6 +1059,8 @@ class NetworkMonitor:
             if self._check_firewall_rule_exists(display_name):
                 if entity not in self.logged_skip_entities:
                     self._log(f"FIREWALL_SKIP {entity} (rule already exists in Windows Firewall, display_name={display_name})")
+                    if len(self.logged_skip_entities) >= MAX_LOGGED_SKIP_ENTITIES:
+                        self.logged_skip_entities.clear()
                     self.logged_skip_entities.add(entity)
                 # Return tuple: (success, was_new_rule, display_name)
                 return (True, False, display_name)
@@ -1590,9 +1603,15 @@ The {entity_type.lower()} has been automatically blocked due to reaching L4 seve
 """
                 self._send_email_alert(subject, body)
                 self.firewall_block_emails_sent.add(entity)
+                self._firewall_block_emails_sent_order.append(entity)
+                while len(self.firewall_block_emails_sent) > MAX_FIREWALL_BLOCK_EMAILS_SENT and self._firewall_block_emails_sent_order:
+                    old = self._firewall_block_emails_sent_order.popleft()
+                    self.firewall_block_emails_sent.discard(old)
         elif blocked and not was_new_rule:
             if entity not in self.email_skip_logged:
                 self._log(f"Email alert skipped for {entity} (rule already existed)")
+                if len(self.email_skip_logged) >= MAX_EMAIL_SKIP_LOGGED:
+                    self.email_skip_logged.clear()
                 self.email_skip_logged.add(entity)
 
     def process_packet(self, packet: Any) -> None:
