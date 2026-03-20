@@ -1012,6 +1012,105 @@ class NetworkMonitor:
         except (ValueError, subprocess.TimeoutExpired, subprocess.SubprocessError) as e:
             self._log(f"Error checking firewall rule existence: {e}", "WARNING")
             return False
+
+    def _parse_ip_range(self, value: str) -> Optional[Tuple[ipaddress.IPv4Address, ipaddress.IPv4Address]]:
+        """Parse an IPv4 range in format x.x.x.x-y.y.y.y."""
+        if "-" not in value:
+            return None
+        parts = value.split("-", 1)
+        if len(parts) != 2:
+            return None
+        try:
+            start = ipaddress.ip_address(parts[0].strip())
+            end = ipaddress.ip_address(parts[1].strip())
+        except ValueError:
+            return None
+        if start.version != 4 or end.version != 4:
+            return None
+        if int(start) > int(end):
+            return None
+        return start, end
+
+    def _is_remote_address_covered(self, target_address: str, existing_address: str) -> bool:
+        """
+        Return True when existing_address covers target_address.
+        Supports IPv4 single IP, CIDR, and start-end range formats.
+        """
+        existing = existing_address.strip()
+        if not existing:
+            return False
+
+        if existing.lower() in {"any", "*", "localsubnet", "defaultgateway", "dns", "dhcp", "wins"}:
+            return False
+
+        target_range = self._parse_ip_range(target_address)
+        existing_range = self._parse_ip_range(existing)
+
+        target_ip = None
+        target_net = None
+        existing_ip = None
+        existing_net = None
+
+        if not target_range:
+            try:
+                if "/" in target_address:
+                    target_net = ipaddress.ip_network(target_address, strict=False)
+                else:
+                    target_ip = ipaddress.ip_address(target_address)
+            except ValueError:
+                return False
+
+        if not existing_range:
+            try:
+                if "/" in existing:
+                    existing_net = ipaddress.ip_network(existing, strict=False)
+                else:
+                    existing_ip = ipaddress.ip_address(existing)
+            except ValueError:
+                return False
+
+        if target_ip is not None:
+            if existing_ip is not None:
+                return target_ip == existing_ip
+            if existing_net is not None:
+                return target_ip in existing_net
+            if existing_range is not None:
+                return int(existing_range[0]) <= int(target_ip) <= int(existing_range[1])
+            return False
+
+        if target_net is not None:
+            if existing_ip is not None:
+                return False
+            if existing_net is not None:
+                return target_net.subnet_of(existing_net)
+            if existing_range is not None:
+                return int(existing_range[0]) <= int(target_net.network_address) and int(target_net.broadcast_address) <= int(existing_range[1])
+            return False
+
+        if target_range is not None:
+            target_start, target_end = target_range
+            if existing_ip is not None:
+                return False
+            if existing_net is not None:
+                return target_start in existing_net and target_end in existing_net
+            if existing_range is not None:
+                return int(existing_range[0]) <= int(target_start) and int(target_end) <= int(existing_range[1])
+            return False
+
+        return False
+
+    def _find_similar_firewall_rule(self, remote_address: str) -> Optional[str]:
+        """Return display name of a managed firewall rule that already covers remote_address."""
+        for rule in self.list_firewall_rules(FIREWALL_PREFIX):
+            display_name = str(rule.get("DisplayName", "")).strip()
+            remote_values = str(rule.get("RemoteAddress", "")).strip()
+            if not display_name or not remote_values:
+                continue
+            addresses = [value.strip() for value in remote_values.split(",") if value.strip()]
+            for existing_address in addresses:
+                if self._is_remote_address_covered(remote_address, existing_address):
+                    return display_name
+        return None
     
     def _add_firewall_rule(self, entity: str, is_subnet: bool = False) -> Tuple[bool, bool, str]:
         """
@@ -1063,6 +1162,18 @@ class NetworkMonitor:
                         self.logged_skip_entities.clear()
                     self.logged_skip_entities.add(entity)
                 # Return tuple: (success, was_new_rule, display_name)
+                return (True, False, display_name)
+
+            similar_rule_display_name = self._find_similar_firewall_rule(remote_address)
+            if similar_rule_display_name:
+                if entity not in self.logged_skip_entities:
+                    self._log(
+                        f"FIREWALL_SKIP {entity} (similar firewall rule already exists, "
+                        f"existing_display_name={similar_rule_display_name}, remote_address={remote_address})"
+                    )
+                    if len(self.logged_skip_entities) >= MAX_LOGGED_SKIP_ENTITIES:
+                        self.logged_skip_entities.clear()
+                    self.logged_skip_entities.add(entity)
                 return (True, False, display_name)
             
             # Create the firewall rule
