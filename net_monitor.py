@@ -1695,7 +1695,18 @@ class NetworkMonitor:
         """Handle firewall blocking and email alerts for L4 entities."""
         if not self.auto_block:
             return
-        
+
+        # Never auto-block private/loopback/link-local sources or their /16 subnets.
+        # For subnet entities (e.g. "192.168.0.0/16"), check the base address.
+        check_ip = entity.split("/", 1)[0] if is_subnet else entity
+        if self._is_private_ip(check_ip):
+            if entity not in self.logged_skip_entities:
+                self._log(f"FIREWALL_SKIP {entity} (private network, auto-block disabled for RFC1918)")
+                if len(self.logged_skip_entities) >= MAX_LOGGED_SKIP_ENTITIES:
+                    self.logged_skip_entities.clear()
+                self.logged_skip_entities.add(entity)
+            return
+
         blocked, was_new_rule, display_name = self._add_firewall_rule(entity, is_subnet=is_subnet)
         
         if blocked and was_new_rule:
